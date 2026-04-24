@@ -18,13 +18,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from pydantic_ai.capabilities import AbstractCapability, WrapModelRequestHandler
 from pydantic_ai.exceptions import SkipModelRequest
-from pydantic_ai.messages import ModelResponse, TextPart, UserPromptPart
+from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, UserPromptPart
 from pydantic_ai.tools import AgentDepsT, RunContext
 
 from pydantic_ai_harness.guardrails._exceptions import OutputBlocked
@@ -51,7 +51,7 @@ async def _evaluate(guard: GuardrailFunc, value: str) -> bool:
     return result
 
 
-def _extract_prompt(ctx: RunContext[AgentDepsT], messages: list[Any]) -> str | None:
+def _extract_prompt(ctx: RunContext[AgentDepsT], messages: Sequence[ModelMessage]) -> str | None:
     """Return the text of the most recent user prompt, or `None` if absent.
 
     Prefers `ctx.prompt` (set at run start) and falls back to scanning the
@@ -61,10 +61,7 @@ def _extract_prompt(ctx: RunContext[AgentDepsT], messages: list[Any]) -> str | N
     if ctx.prompt is not None:
         return ctx.prompt if isinstance(ctx.prompt, str) else str(ctx.prompt)
     for message in reversed(messages):
-        parts = getattr(message, 'parts', None)
-        if not parts:
-            continue
-        for part in reversed(parts):
+        for part in reversed(message.parts):
             if isinstance(part, UserPromptPart):
                 return part.content if isinstance(part.content, str) else str(part.content)
     return None
@@ -129,7 +126,7 @@ class InputGuard(AbstractCapability[AgentDepsT]):
         """Check the prompt before the model call in sequential mode."""
         if self.parallel or ctx.run_step > 1:
             return request_context
-        prompt = _extract_prompt(ctx, list(request_context.messages))
+        prompt = _extract_prompt(ctx, request_context.messages)
         if prompt is None:
             return request_context
         await self._run_guard(prompt)
@@ -145,7 +142,7 @@ class InputGuard(AbstractCapability[AgentDepsT]):
         """Run the guard alongside the model call when `parallel=True`."""
         if not self.parallel or ctx.run_step > 1:
             return await handler(request_context)
-        prompt = _extract_prompt(ctx, list(request_context.messages))
+        prompt = _extract_prompt(ctx, request_context.messages)
         if prompt is None:
             return await handler(request_context)
         async def run_handler() -> ModelResponse:

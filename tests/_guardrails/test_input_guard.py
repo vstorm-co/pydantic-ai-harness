@@ -9,6 +9,7 @@ import pytest
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import SkipModelRequest
 from pydantic_ai.messages import (
+    ModelMessage,
     ModelRequest,
     ModelResponse,
     TextPart,
@@ -77,7 +78,7 @@ def test_extract_prompt_from_messages():
     class _Ctx:
         prompt = None
 
-    messages: list[Any] = [
+    messages: list[ModelMessage] = [
         ModelRequest(parts=[UserPromptPart(content='first')]),
         ModelResponse(parts=[TextPart(content='assistant')]),
         ModelRequest(parts=[UserPromptPart(content='second')]),
@@ -96,18 +97,17 @@ def test_extract_prompt_stringifies_non_str_message_part():
     class _Ctx:
         prompt = None
 
-    messages: list[Any] = [ModelRequest(parts=[UserPromptPart(content=['multi'])])]
+    messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=['multi'])])]
     assert _extract_prompt(_Ctx(), messages) == str(['multi'])  # pyright: ignore[reportArgumentType]
 
 
-def test_extract_prompt_skips_messages_without_parts():
+def test_extract_prompt_returns_none_when_no_user_prompt_part():
+    """A history containing only model responses yields `None`."""
+
     class _Ctx:
         prompt = None
 
-    class _EmptyMessage:
-        pass
-
-    messages: list[Any] = [_EmptyMessage(), ModelResponse(parts=[TextPart(content='only model parts here')])]
+    messages: list[ModelMessage] = [ModelResponse(parts=[TextPart(content='only model parts here')])]
     assert _extract_prompt(_Ctx(), messages) is None  # pyright: ignore[reportArgumentType]
 
 async def _build_ctx_and_req(run_step: int = 1) -> tuple[Any, Any]:
@@ -402,7 +402,7 @@ async def test_guard_runs_once_across_tool_loop():
     agent = Agent(model, capabilities=[InputGuard[None](guard=guard)])
 
     @agent.tool_plain
-    def ping() -> str:
+    def ping() -> str:  # pyright: ignore[reportUnusedFunction]
         return 'pong'
 
     result = await agent.run('hello')
