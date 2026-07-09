@@ -1043,6 +1043,9 @@ codemode = [
 dbos = [
     { name = "pydantic-ai-slim", extra = ["dbos"] },
 ]
+dynamic-workflow = [
+    { name = "pydantic-monty" },
+]
 logfire = [
     { name = "logfire" },
     { name = "pydantic-ai-slim", extra = ["spec"] },
@@ -1081,8 +1084,9 @@ requires-dist = [
     { name = "pydantic-ai-slim", extras = ["temporal"], marker = "extra == 'temporal'" },
     { name = "pydantic-monty", marker = "extra == 'code-mode'", specifier = ">=0.0.16" },
     { name = "pydantic-monty", marker = "extra == 'codemode'", specifier = ">=0.0.16" },
+    { name = "pydantic-monty", marker = "extra == 'dynamic-workflow'", specifier = ">=0.0.16" },
 ]
-provides-extras = ["acp", "code-mode", "codemode", "dbos", "logfire", "temporal"]
+provides-extras = ["acp", "code-mode", "codemode", "dbos", "dynamic-workflow", "logfire", "temporal"]
 
 [package.metadata.requires-dev]
 dev = [
