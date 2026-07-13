@@ -136,7 +136,7 @@ class TestRenderPrompt:
     def test_truncation_keeps_tail(self) -> None:
         content = ''.join(f'- fact {i}\n' for i in range(5))
         result = render_memory_prompt(content, [], agent_name='main', guidance='', max_lines=2, max_tokens=None)
-        assert '... [3 earlier lines — read_memory("MEMORY.md") for the full notebook] ...' in result
+        assert '... [3 earlier lines -- read_memory("MEMORY.md") for the full notebook] ...' in result
         assert '- fact 4' in result
         assert '- fact 0' not in result
 

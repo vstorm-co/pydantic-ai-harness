@@ -33,7 +33,7 @@ def normalize_filename(file: str) -> str:
         name = f'{name}.md'
     if not _FILENAME_RE.fullmatch(name) or '..' in name:
         raise ModelRetry(
-            f'{file!r} is not a valid memory filename — use a short name like "postgres-migration.md" '
+            f'{file!r} is not a valid memory filename -- use a short name like "postgres-migration.md" '
             '(letters, digits, dots, dashes; no slashes).'
         )
     return name
@@ -90,7 +90,7 @@ def render_memory_prompt(
     """
     lines, dropped = _clip_to_budget(main_content.rstrip().splitlines(), max_lines, max_tokens)
     if dropped:
-        marker = f'... [{dropped} earlier lines — read_memory("{MAIN_FILENAME}") for the full notebook] ...'
+        marker = f'... [{dropped} earlier lines -- read_memory("{MAIN_FILENAME}") for the full notebook] ...'
         lines = [marker, *lines]
     sections = [f'## Agent Memory ({agent_name})']
     if guidance:
@@ -117,11 +117,11 @@ def _apply_write(existing: str | None, content: str, old_text: str | None, name:
             return f'{existing.rstrip()}\n{content.rstrip()}\n', 'Appended to'
         return f'{content.rstrip()}\n', 'Appended to'
     if existing is None:
-        raise ModelRetry(f'There is no memory file named {name!r} to edit — omit `old_text` to create it.')
+        raise ModelRetry(f'There is no memory file named {name!r} to edit -- omit `old_text` to create it.')
     occurrences = existing.count(old_text) if old_text else 0
     if occurrences == 0:
         raise ModelRetry(
-            f'`old_text` was not found in {name!r} — call `read_memory("{name}")` to see its current content.'
+            f'`old_text` was not found in {name!r} -- call `read_memory("{name}")` to see its current content.'
         )
     if occurrences > 1:
         raise ModelRetry(
@@ -181,7 +181,7 @@ class MemoryToolset(FunctionToolset[AgentDepsT]):
         capability = self._capability
         name = normalize_filename(file)
         if old_text is None and not content.strip():
-            raise ModelRetry('Nothing to write — pass the text to append, or `old_text` to replace.')
+            raise ModelRetry('Nothing to write -- pass the text to append, or `old_text` to replace.')
         store, scope = capability.resolve_scope(ctx)
         path = self._path(scope, name)
         async with capability.scope_lock(scope):
@@ -211,7 +211,7 @@ class MemoryToolset(FunctionToolset[AgentDepsT]):
         content = await store.read(self._path(scope, name))
         if content is None:
             raise ModelRetry(
-                f'There is no memory file named {name!r} — the existing files are listed in your memory section.'
+                f'There is no memory file named {name!r} -- the existing files are listed in your memory section.'
             )
         return content
 
@@ -230,7 +230,7 @@ class MemoryToolset(FunctionToolset[AgentDepsT]):
         name = normalize_filename(file)
         if name == MAIN_FILENAME:
             raise ModelRetry(
-                f'{MAIN_FILENAME} is your main notebook and cannot be deleted — edit it with `write_memory`.'
+                f'{MAIN_FILENAME} is your main notebook and cannot be deleted -- edit it with `write_memory`.'
             )
         store, scope = capability.resolve_scope(ctx)
         path = self._path(scope, name)

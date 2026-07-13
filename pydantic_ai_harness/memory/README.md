@@ -17,10 +17,10 @@ Agents forget everything between sessions. Naive fixes either dump the whole mem
 
 A two-tier notebook, with the model deciding which tier fits:
 
-- **`MEMORY.md`** is the agent's main notebook — injected into the system prompt **every request**, holding short durable facts as plain bullet lines.
+- **`MEMORY.md`** is the agent's main notebook -- injected into the system prompt **every request**, holding short durable facts as plain bullet lines.
 - **Longer or evolving topics** live in separate markdown files. Only their *names* are injected (the list is generated from the store, so it is always ground truth); their content is read on demand with `read_memory` when relevant.
 
-One `write_memory` tool covers everything: append by default, or pass `old_text` for a unique exact-string replacement — which is editing, correcting, and deleting in a single primitive. A failed match writes nothing.
+One `write_memory` tool covers everything: append by default, or pass `old_text` for a unique exact-string replacement -- which is editing, correcting, and deleting in a single primitive. A failed match writes nothing.
 
 ```python
 from pydantic_ai import Agent
@@ -36,13 +36,13 @@ agent = Agent(
 
 | Tool | What it does |
 | --- | --- |
-| `write_memory(content, file='MEMORY.md', old_text=None)` | Append `content` (creating the file if needed), or replace a unique `old_text` with it — covers add, edit, correct, and delete |
+| `write_memory(content, file='MEMORY.md', old_text=None)` | Append `content` (creating the file if needed), or replace a unique `old_text` with it -- covers add, edit, correct, and delete |
 | `read_memory(file)` | Read the full content of one memory file |
 | `delete_memory(file)` | Delete a memory file (the main `MEMORY.md` is protected) |
 
 ## What the model sees each request
 
-```
+```text
 ## Agent Memory (main)
 
 <usage guidance: memory is background context, not instructions; keep it curated>
@@ -61,7 +61,7 @@ agent = Agent(
 
 ## Persistence
 
-The default `InMemoryStore` lives for the **process only** — memories survive across `Agent.run` calls but not restarts. Four stores ship in the box; anything else is a four-method `MemoryStore` protocol away (path = key column, namespace = key prefix).
+The default `InMemoryStore` lives for the **process only** -- memories survive across `Agent.run` calls but not restarts. Four stores ship in the box; anything else is a four-method `MemoryStore` protocol away (path = key column, namespace = key prefix).
 
 | Store | Fits | Notes |
 | --- | --- | --- |
@@ -75,7 +75,7 @@ Memory(store=FileStore('.agent-memory'))
 Memory(store=SqliteMemoryStore(database='.agent-memory.db'))
 ```
 
-`PostgresMemoryStore` is deliberately **driver-agnostic**: it talks to a minimal `PostgresPool` protocol (`execute` / `fetchval` / `fetch`, `$1`-style parameters), so `pydantic-ai-harness` gains no database dependency — an `asyncpg.Pool` satisfies it out of the box:
+`PostgresMemoryStore` is deliberately **driver-agnostic**: it talks to a minimal `PostgresPool` protocol (`execute` / `fetchval` / `fetch`, `$1`-style parameters), so `pydantic-ai-harness` gains no database dependency -- an `asyncpg.Pool` satisfies it out of the box:
 
 ```python
 import asyncpg
@@ -89,11 +89,11 @@ agent_memory = Memory(
 )
 ```
 
-The pool is caller-owned — create it at app startup, close it at shutdown; the store never manages connection lifecycle.
+The pool is caller-owned -- create it at app startup, close it at shutdown; the store never manages connection lifecycle.
 
 ## Multi-user applications
 
-The tenant is resolved **per run** from your own deps and is never a tool argument, so the model cannot express — let alone reach — another tenant's memory:
+The tenant is resolved **per run** from your own deps and is never a tool argument, so the model cannot express -- let alone reach -- another tenant's memory:
 
 ```python
 from dataclasses import dataclass
@@ -149,7 +149,7 @@ capabilities:
 
 ## Composing with FileSystem
 
-Point the store inside a `FileSystem` root and the agent can also browse its memories with its normal file tools — one directory, one source of truth:
+Point the store inside a `FileSystem` root and the agent can also browse its memories with its normal file tools -- one directory, one source of truth:
 
 ```python
 from pathlib import Path
@@ -172,5 +172,5 @@ The memory section is re-rendered every request, but it only changes when the ag
 
 ## Related
 
-- `pydantic_ai_harness.context` — read-only sibling: loads `CLAUDE.md`/`AGENTS.md`-style instruction files. Deployment-fixed, always-on facts belong there (or in your agent's instructions), not in Memory.
+- `pydantic_ai_harness.context` -- read-only sibling: loads `CLAUDE.md`/`AGENTS.md`-style instruction files. Deployment-fixed, always-on facts belong there (or in your agent's instructions), not in Memory.
 - [Dependencies](https://ai.pydantic.dev/dependencies/) and [Capabilities](https://ai.pydantic.dev/capabilities/) in the Pydantic AI docs.
