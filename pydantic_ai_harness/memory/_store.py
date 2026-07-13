@@ -20,6 +20,7 @@ import anyio.to_thread
 
 _VALID_SEGMENT_RE = re.compile(r'[A-Za-z0-9_.-]{1,200}')
 _JOURNAL_NAME = '.memory-store.sqlite3'
+_FILE_RECOVERY_BATCH_SIZE = 256
 _SQLITE_SETUP_LOCK = threading.RLock()
 _T = TypeVar('_T')
 
@@ -458,6 +459,14 @@ class FileStore:
                     'INSERT OR IGNORE INTO file_metadata(id, generation) '
                     'SELECT 1, COALESCE(MAX(version), 0) FROM file_state'
                 )
+                journal_version_row = connection.execute('PRAGMA user_version').fetchone()
+                assert journal_version_row is not None
+                if int(journal_version_row[0]) < 1:
+                    connection.execute(
+                        'UPDATE memory_operations SET expected_version = NULL, new_content = NULL '
+                        "WHERE status = 'completed' AND (expected_version IS NOT NULL OR new_content IS NOT NULL)"
+                    )
+                    connection.execute('PRAGMA user_version = 1')
                 connection.commit()
             return connection
         except BaseException:
@@ -562,7 +571,11 @@ class FileStore:
                 elif current_version is not None:
                     raise MemoryConflictError(f'externally modified memory path {pending_path!r} blocks recovery')
                 connection.execute('DELETE FROM file_state WHERE path = ?', (pending_path,))
-            connection.execute("UPDATE memory_operations SET status = 'completed' WHERE id = ?", (operation_id,))
+            connection.execute(
+                "UPDATE memory_operations SET status = 'completed', expected_version = NULL, new_content = NULL "
+                'WHERE id = ?',
+                (operation_id,),
+            )
 
     def _get_operation(self, connection: sqlite3.Connection, operation: MemoryOperation) -> MemoryMutation | None:
         row = connection.execute(
@@ -741,21 +754,14 @@ class FileStore:
 
     def _sync_list_paths(self, prefix: str, limit: int) -> list[str]:
         def op(connection: sqlite3.Connection) -> list[str]:
-            rows = connection.execute(
-                "SELECT DISTINCT path FROM memory_operations WHERE status = 'prepared' "
-                'AND substr(path, 1, length(?)) = ? ORDER BY path LIMIT ?',
-                (prefix, prefix, limit),
-            ).fetchall()
-            for row in rows:
-                self._recover(connection, str(row[0]))
             root = Path(os.path.realpath(self._root))
             walk_root = root
             if prefix.endswith('/'):
                 walk_root = self._resolve(prefix.removesuffix('/'))
-                if not walk_root.is_dir():
-                    return []
 
             def paths(directory: Path) -> Iterable[str]:
+                if not directory.is_dir():
+                    return
                 with os.scandir(directory) as entries:
                     for entry in entries:
                         item = Path(entry.path)
@@ -770,7 +776,19 @@ class FileStore:
                             if relative.startswith(prefix):
                                 yield relative
 
-            return heapq.nsmallest(limit, paths(walk_root))
+            while True:
+                selected = heapq.nsmallest(limit, paths(walk_root))
+                pending = connection.execute(
+                    "SELECT DISTINCT path FROM memory_operations WHERE status = 'prepared' "
+                    'AND substr(path, 1, length(?)) = ? ORDER BY path LIMIT ?',
+                    (prefix, prefix, _FILE_RECOVERY_BATCH_SIZE),
+                ).fetchall()
+                if not pending:
+                    return selected
+                if len(selected) == limit and str(pending[0][0]) > selected[-1]:
+                    return selected
+                for row in pending:
+                    self._recover(connection, str(row[0]))
 
         return self._transaction(op)
 
@@ -793,8 +811,12 @@ class FileStore:
             files: list[tuple[str, str]] = []
             truncated = False
             for path in paths[:max_files]:
-                with self._resolve(path).open(encoding='utf-8') as file:
-                    content = file.read(max_file_chars + 1)
+                try:
+                    with self._resolve(path).open(encoding='utf-8') as file:
+                        content = file.read(max_file_chars + 1)
+                except FileNotFoundError:
+                    truncated = True
+                    continue
                 truncated = truncated or len(content) > max_file_chars
                 files.append((path, content[:max_file_chars]))
             return files, truncated
@@ -852,6 +874,8 @@ class SqliteMemoryStore:
             assert self._database is not None
             connection = sqlite3.connect(self._database, timeout=30, check_same_thread=False)
             owned = True
+        if not owned and connection.in_transaction:
+            raise RuntimeError('caller-owned SQLite connection must be idle before a memory operation')
         try:
             connection.execute('PRAGMA busy_timeout = 30000')
             if owned:

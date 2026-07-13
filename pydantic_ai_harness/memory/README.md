@@ -15,7 +15,7 @@ Memory is a released, non-experimental capability. Pydantic AI Harness is still 
 
 Memory gives each agent a notebook made of Markdown files:
 
-- `MEMORY.md` is the main notebook. By default, a bounded excerpt and the names of other files are injected before each model request.
+- `MEMORY.md` is the main notebook. By default, a bounded excerpt and the names of other files are added to the current request as delimited user-role context.
 - Other files hold longer or focused notes. The model reads them on demand or finds them with bounded text search.
 
 The model gets four tools:
@@ -42,7 +42,7 @@ The namespace is resolved by application code, not supplied to the tools. The mo
 
 ## Injection modes and limits
 
-Automatic injection is enabled by default. The main notebook and file listing share a finite `max_tokens` budget, estimated at four characters per token. The default is 2,000 approximate tokens. `max_lines` is an additional limit on the main notebook. Backend reads are limited by `max_memory_size`, and the number of requested paths is derived from the prompt budget, so the capability never requests an unbounded file or listing. Content that does not fit is omitted with a prompt directing the model to use `read_memory` or `search_memory`.
+Automatic injection is enabled by default. Trusted usage guidance remains in model instructions, while model-written memory is enclosed in `<memory>` delimiters in a user-role part on the current request. Together, the guidance, main notebook, and file listing share a finite `max_tokens` budget, estimated at four characters per token. The default is 2,000 approximate tokens. `max_lines` is an additional limit on the main notebook. Backend reads are limited by `max_memory_size`, and the number of requested paths is derived from the prompt budget, so the capability never requests an unbounded file or listing. Content that does not fit is omitted with a prompt directing the model to use `read_memory` or `search_memory`.
 
 ```python
 from pydantic_ai_harness.memory import FileStore, Memory
@@ -54,7 +54,7 @@ memory = Memory(
 )
 ```
 
-Injection is deduplicated within one agent run. After `write_memory` changes `MEMORY.md`, that exact stored version is suppressed from later automatic injection because the tool call and result are already in the run history. A different stored version is eligible for injection again.
+Only the current request retains the injected user-role part, so copies do not accumulate in message history. Each model request receives the latest bounded snapshot, including after `write_memory` or an external update changes `MEMORY.md`.
 
 Set `inject_memory=False` for cache-stable prompts or durable workflows. The tools remain available, and the model can fetch memory only when it needs it:
 
@@ -86,7 +86,7 @@ local_memory = Memory(FileStore('.agent-memory'))
 sqlite_memory = Memory(SqliteMemoryStore(database='.agent-memory.db'))
 ```
 
-`SqliteMemoryStore` can instead use a caller-owned `sqlite3.Connection`. Because operations run off the event loop, create that connection with `check_same_thread=False` and manage its lifecycle in the application.
+`SqliteMemoryStore` can instead use a caller-owned `sqlite3.Connection`. Because operations run off the event loop, create that connection with `check_same_thread=False` and manage its lifecycle in the application. The connection must be dedicated to the store and idle at the start of every operation; a call fails rather than commit or roll back an active caller transaction.
 
 `FileStore` keeps the journal at `.memory-store.sqlite3` inside its root. Keep it with the Markdown files when copying or backing up the store. Editing a Markdown file outside the capability changes its content version and can produce a conflict with a prepared operation; the journal recovers operations interrupted between transaction preparation and filesystem replacement.
 
@@ -147,6 +147,8 @@ Namespace isolation controls which records the capability addresses. It is not a
 
 The bundled stores implement `SearchableMemoryStore`. For a custom store that implements only `MemoryStore`, `search_memory` requests at most `max_search_files + 1` paths, scans at most `max_search_files`, and performs bounded reads. Lexical scoring uses only each scope-relative filename and its bounded content; tenant namespaces and agent names never affect relevance. Implement the optional search protocol for an indexed or semantic backend while preserving the same tenant boundary and result limits. Semantic ranking is not built in.
 
+Before backend dispatch, queries are limited to 1,000 characters and 32 unique whitespace-separated terms. Repeated case-insensitive terms are collapsed so they cannot inflate scoring or scan work.
+
 ## Configuration
 
 ```python
@@ -203,7 +205,7 @@ The memory backend and the workflow state backend are independent. Durable execu
 
 ## Security and provenance
 
-Memory is model-written, untrusted content that can re-enter future prompts. The injected section frames it as records rather than instructions, but this does not eliminate prompt injection. Do not store secrets unless the backend, retention policy, and access controls are appropriate. Sanitize content before rendering it into another trust domain.
+Memory is model-written, untrusted content that can re-enter future prompts. Keeping it in a delimited user-role part lowers its authority relative to model instructions, but this is not a hard prompt-injection boundary. Use `inject_memory=False` when less-trusted actors can write to the store, and expose memory only through application-controlled retrieval when stronger isolation is required. Do not store secrets unless the backend, retention policy, and access controls are appropriate. Sanitize content before rendering it into another trust domain.
 
 Memory records do not carry source citations or verified provenance. If an application needs auditable facts, store provenance in the note itself or implement a custom store and schema. Optimistic concurrency prevents lost updates; it does not establish that a remembered claim is true.
 

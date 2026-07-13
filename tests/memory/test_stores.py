@@ -378,6 +378,45 @@ async def test_file_store_recovers_a_prepared_write(tmp_path: Path) -> None:
     assert receipt is not None
     assert receipt.replayed
     assert receipt.version == new_version
+    connection = sqlite3.connect(tmp_path / '.memory-store.sqlite3')
+    try:
+        row = connection.execute(
+            'SELECT expected_version, new_content FROM memory_operations WHERE id = ?', (operation.id,)
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row == (None, None)
+
+
+async def test_file_store_scrubs_completed_operation_recovery_payloads(tmp_path: Path) -> None:
+    store = FileStore(tmp_path)
+    operation = MemoryOperation(id='run-1:call-1', fingerprint='write:main.md:secret')
+    created = await store.write('main.md', 'secret', expected_version=None, operation=operation)
+    assert created.version is not None
+    connection = sqlite3.connect(tmp_path / '.memory-store.sqlite3')
+    try:
+        connection.execute(
+            'UPDATE memory_operations SET expected_version = ?, new_content = ? WHERE id = ?',
+            ('legacy-version', 'legacy-secret', operation.id),
+        )
+        connection.execute('PRAGMA user_version = 0')
+        connection.commit()
+    finally:
+        connection.close()
+
+    receipt = await FileStore(tmp_path).get_operation(operation)
+
+    assert receipt is not None
+    assert receipt.replayed
+    assert receipt.version == created.version
+    connection = sqlite3.connect(tmp_path / '.memory-store.sqlite3')
+    try:
+        row = connection.execute(
+            'SELECT expected_version, new_content, result_version FROM memory_operations WHERE id = ?', (operation.id,)
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row == (None, None, created.version)
 
 
 async def test_file_store_get_operation_recovers_a_prepared_write(tmp_path: Path) -> None:
@@ -529,6 +568,148 @@ async def test_file_store_listing_recovers_only_the_requested_tenant(tmp_path: P
         await FileStore(tmp_path).list_paths('tenant-a/', limit=10)
 
 
+async def test_file_store_bounded_listing_recovers_deletes_until_page_is_stable(tmp_path: Path) -> None:
+    store = FileStore(tmp_path)
+    versions: dict[str, str] = {}
+    for path in ('a.md', 'b.md', 'c.md'):
+        mutation = await store.write(path, path, expected_version=None)
+        assert mutation.version is not None
+        versions[path] = mutation.version
+    connection = sqlite3.connect(tmp_path / '.memory-store.sqlite3')
+    try:
+        connection.executemany(
+            'INSERT INTO memory_operations '
+            '(id, fingerprint, status, kind, path, expected_version, new_content, result_version, existed) '
+            "VALUES (?, ?, 'prepared', 'delete', ?, ?, NULL, NULL, 1)",
+            [(f'delete-{path}', f'delete:{path}', path, versions[path]) for path in ('a.md', 'b.md')],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert await FileStore(tmp_path).list_paths(limit=1) == ['c.md']
+    assert not (tmp_path / 'a.md').exists()
+    assert not (tmp_path / 'b.md').exists()
+
+
+async def test_file_store_bounded_listing_recovers_prepared_write_before_page_boundary(tmp_path: Path) -> None:
+    store = FileStore(tmp_path)
+    created = await store.write('b.md', 'b', expected_version=None)
+    assert created.version is not None
+    result_version = str(int(created.version) + 1)
+    connection = sqlite3.connect(tmp_path / '.memory-store.sqlite3')
+    try:
+        connection.execute(
+            'INSERT INTO memory_operations '
+            '(id, fingerprint, status, kind, path, expected_version, new_content, result_version, existed) '
+            "VALUES ('write-a', 'write:a.md:a', 'prepared', 'write', 'a.md', NULL, 'a', ?, 0)",
+            (result_version,),
+        )
+        connection.execute('UPDATE file_metadata SET generation = ?', (int(result_version),))
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert await FileStore(tmp_path).list_paths(limit=1) == ['a.md']
+    assert (tmp_path / 'a.md').read_text() == 'a'
+
+
+async def test_file_store_bounded_listing_leaves_irrelevant_pending_path_prepared(tmp_path: Path) -> None:
+    store = FileStore(tmp_path)
+    await store.write('a.md', 'a', expected_version=None)
+    connection = store._connect()
+    try:
+        result_version = str(store._next_generation(connection))
+        connection.execute(
+            'INSERT INTO memory_operations '
+            '(id, fingerprint, status, kind, path, expected_version, new_content, result_version, existed) '
+            "VALUES ('write-z', 'write:z.md:z', 'prepared', 'write', 'z.md', NULL, 'z', ?, 0)",
+            (result_version,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert await FileStore(tmp_path).list_paths(limit=1) == ['a.md']
+    assert not (tmp_path / 'z.md').exists()
+
+
+async def test_file_store_scoped_listing_recovers_write_that_creates_scope_directory(tmp_path: Path) -> None:
+    store = FileStore(tmp_path)
+    connection = store._connect()
+    try:
+        result_version = str(store._next_generation(connection))
+        connection.execute(
+            'INSERT INTO memory_operations '
+            '(id, fingerprint, status, kind, path, expected_version, new_content, result_version, existed) '
+            "VALUES ('write-a', 'write:tenant/a.md:a', 'prepared', 'write', 'tenant/a.md', NULL, 'a', ?, 0)",
+            (result_version,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert not (tmp_path / 'tenant').exists()
+    assert await FileStore(tmp_path).list_paths('tenant/', limit=1) == ['tenant/a.md']
+    assert (tmp_path / 'tenant' / 'a.md').read_text() == 'a'
+
+
+async def test_file_store_page_recovery_uses_bounded_lookahead(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = FileStore(tmp_path)
+    versions: dict[str, str] = {}
+    for index in range(21):
+        path = f'{index:02}.md'
+        mutation = await store.write(path, path, expected_version=None)
+        assert mutation.version is not None
+        versions[path] = mutation.version
+    connection = sqlite3.connect(tmp_path / '.memory-store.sqlite3')
+    try:
+        connection.executemany(
+            'INSERT INTO memory_operations '
+            '(id, fingerprint, status, kind, path, expected_version, new_content, result_version, existed) '
+            "VALUES (?, ?, 'prepared', 'delete', ?, ?, NULL, NULL, 1)",
+            [(f'delete-{path}', f'delete:{path}', path, versions[path]) for path in sorted(versions)[:20]],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    original_scandir = os.scandir
+    scans = 0
+
+    def counted_scandir(path: str | os.PathLike[str]) -> Iterator[os.DirEntry[str]]:
+        nonlocal scans
+        scans += 1
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, 'scandir', counted_scandir)
+
+    assert await FileStore(tmp_path).list_paths(limit=1) == ['20.md']
+    assert scans == 2
+
+
+async def test_file_store_search_skips_a_file_that_disappears_after_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FileStore(tmp_path)
+    await store.write('a.md', 'alpha', expected_version=None)
+    await store.write('b.md', 'alpha', expected_version=None)
+    original_resolve = store._resolve
+
+    def disappearing_resolve(path: str) -> Path:
+        target = original_resolve(path)
+        if path == 'a.md':
+            target.unlink(missing_ok=True)
+        return target
+
+    monkeypatch.setattr(store, '_resolve', disappearing_resolve)
+
+    result = await store.search('', 'alpha', limit=2, max_files=2, max_chars=100, max_file_chars=100)
+
+    assert [match.path for match in result.matches] == ['b.md']
+    assert result.scanned == 1
+    assert result.truncated
+
+
 async def test_file_store_scoped_listing_walks_only_the_requested_tenant(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -610,10 +791,36 @@ async def test_sqlite_store_supports_caller_owned_connection() -> None:
         connection.close()
 
 
+async def test_sqlite_store_does_not_commit_a_caller_owned_transaction(tmp_path: Path) -> None:
+    database = tmp_path / 'caller-owned.sqlite3'
+    connection = sqlite3.connect(database, check_same_thread=False)
+    try:
+        connection.execute('CREATE TABLE unrelated(value TEXT)')
+        connection.commit()
+        store = SqliteMemoryStore(connection=connection)
+        await store.read('missing.md', max_chars=100)
+        connection.execute('BEGIN')
+        connection.execute("INSERT INTO unrelated VALUES ('caller-work')")
+
+        with pytest.raises(RuntimeError, match='must be idle'):
+            await store.read('missing.md', max_chars=100)
+
+        assert connection.in_transaction
+        observer = sqlite3.connect(database)
+        try:
+            assert observer.execute('SELECT value FROM unrelated').fetchall() == []
+        finally:
+            observer.close()
+        connection.rollback()
+    finally:
+        connection.close()
+
+
 async def test_sqlite_store_rolls_back_failed_schema_initialization() -> None:
     connection = sqlite3.connect(':memory:', check_same_thread=False)
     try:
         connection.execute("CREATE VIEW memory_files AS SELECT 'main.md' AS path, 'content' AS content")
+        connection.commit()
         store = SqliteMemoryStore(connection=connection)
         with pytest.raises(sqlite3.OperationalError):
             await store.read('main.md', max_chars=1_000)

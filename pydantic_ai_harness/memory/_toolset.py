@@ -27,11 +27,13 @@ if TYPE_CHECKING:
     from pydantic_ai_harness.memory._capability import Memory
 
 MAIN_FILENAME = 'MEMORY.md'
-"""The main notebook file injected into model instructions."""
+"""The main notebook file injected as bounded user-role context."""
 
 _FILENAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}')
 _CHARS_PER_TOKEN = 4
 _MAX_CAS_ATTEMPTS = 16
+_MAX_SEARCH_QUERY_CHARS = 1_000
+_MAX_SEARCH_TERMS = 32
 _MIN_FILENAME_LIST_CHARS = 6
 _READ_TRUNCATION_MARKER = (
     '\n\n[Truncated: this file exceeds `max_memory_size`; edit it externally before using `write_memory`.]'
@@ -83,6 +85,26 @@ def normalize_filename(file: str) -> str:
             '(letters, digits, dots, dashes; no slashes).'
         )
     return name
+
+
+def _normalize_search_query(query: str) -> str:
+    if len(query) > _MAX_SEARCH_QUERY_CHARS:
+        raise ModelRetry(f'Search queries must be at most {_MAX_SEARCH_QUERY_CHARS} characters.')
+    normalized = query.strip()
+    if not normalized:
+        raise ModelRetry('Pass a non-empty search query.')
+
+    terms: list[str] = []
+    seen: set[str] = set()
+    for term in normalized.split():
+        key = term.lower()
+        if key in seen:
+            continue
+        if len(terms) == _MAX_SEARCH_TERMS:
+            raise ModelRetry(f'Search queries must contain at most {_MAX_SEARCH_TERMS} unique terms.')
+        seen.add(key)
+        terms.append(term)
+    return ' '.join(terms)
 
 
 async def list_subfiles(store: MemoryStore, scope: str, *, limit: int) -> tuple[list[str], bool]:
@@ -303,8 +325,6 @@ class MemoryToolset(FunctionToolset[AgentDepsT]):
                 previous_mutation = await store.get_operation(operation)
                 if previous_mutation is not None:
                     result = _write_result(name, previous_mutation, old_text)
-                    if name == MAIN_FILENAME:
-                        capability.record_main_version(path, result['version'])
                     _set_span_result(span, 'replayed', replayed=True)
                     return result
 
@@ -338,8 +358,6 @@ class MemoryToolset(FunctionToolset[AgentDepsT]):
                             raise ModelRetry('Memory changed repeatedly while writing; retry the operation.')
                         continue
                     result = _write_result(name, mutation, old_text, status=status)
-                    if name == MAIN_FILENAME:
-                        capability.record_main_version(path, result['version'])
                     _set_span_result(span, 'ok', chars=len(updated), replayed=mutation.replayed)
                     return result
                 raise RuntimeError('unreachable CAS retry state')  # pragma: no cover
@@ -433,8 +451,7 @@ class MemoryToolset(FunctionToolset[AgentDepsT]):
             ctx: Framework-provided run context.
             query: Terms to find in memory filenames and content.
         """
-        if not query.strip():
-            raise ModelRetry('Pass a non-empty search query.')
+        query = _normalize_search_query(query)
         capability = self._capability
         store, scope = capability.resolve_scope(ctx)
         prefix = f'{scope}/'

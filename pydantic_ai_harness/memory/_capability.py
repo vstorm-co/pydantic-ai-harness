@@ -9,6 +9,8 @@ from typing import Literal
 
 from pydantic_ai.agent.abstract import AgentInstructions
 from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelRequestPart, TextContent, UserPromptPart
+from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.tools import AgentDepsT, RunContext
 from pydantic_ai.toolsets import AgentToolset
 
@@ -34,20 +36,18 @@ _DEFAULT_GUIDANCE = (
     'in this turn.'
 )
 
-_EMPTY_GUIDANCE = (
-    'Your persistent memory is empty. When you learn something durable a future session will '
-    'need, store it with `write_memory`: short facts as bullet lines in MEMORY.md, longer '
-    'topics in their own file.'
-)
+_MEMORY_DATA_PREFIX = '<memory>\n'
+_MEMORY_DATA_SUFFIX = '\n</memory>'
+_MEMORY_PART_METADATA = 'pydantic-ai-harness.memory.v1'
 
 
 @dataclass
 class Memory(AbstractCapability[AgentDepsT]):
     """Persistent agent memory across sessions.
 
-    `MEMORY.md` is injected into model instructions and longer topic files are
+    `MEMORY.md` is injected as user-role context and longer topic files are
     available through `read_memory` and `search_memory`. Store access performed
-    by instruction injection is not workflow-safe durable I/O. With Temporal or
+    by automatic injection is not workflow-safe durable I/O. With Temporal or
     Prefect, use `inject_memory=False`; the static, idempotent `memory` toolset
     can then be wrapped by those integrations. DBOS does not currently wrap an
     ordinary `FunctionToolset` as a durable step, so this capability's tools are
@@ -91,9 +91,8 @@ class Memory(AbstractCapability[AgentDepsT]):
     """Override injected usage guidance; `''` disables guidance."""
 
     injection_errors: Literal['ignore', 'raise'] = 'ignore'
-    """Whether store failures during instruction injection are ignored or raised."""
+    """Whether store failures during automatic injection are ignored or raised."""
 
-    _seen_main_versions: dict[str, str] = field(default_factory=dict[str, str], init=False, repr=False, compare=False)
     _resolved_scope: tuple[MemoryStore, str] | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -107,9 +106,8 @@ class Memory(AbstractCapability[AgentDepsT]):
             raise ValueError("injection_errors must be 'ignore' or 'raise'")
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> Memory[AgentDepsT]:
-        """Return a clone whose injection-dedup state is isolated to this run."""
+        """Return a clone with scope resolution isolated to this run."""
         clone = replace(self)
-        clone._seen_main_versions = {}
         clone._resolved_scope = None
         clone._resolved_scope = clone._resolve_scope(ctx)
         return clone
@@ -127,115 +125,133 @@ class Memory(AbstractCapability[AgentDepsT]):
         validate_store_path(scope)
         return store, scope
 
-    def record_main_version(self, path: str, version: str) -> None:
-        """Suppress reinjection while the stored main-file version remains unchanged."""
-        self._seen_main_versions[path] = version
-
     def get_toolset(self) -> AgentToolset[AgentDepsT] | None:
         """Provide the stable `memory` toolset."""
         return MemoryToolset(self)
 
     def get_instructions(self) -> AgentInstructions[AgentDepsT] | None:
-        """Provide static guidance or inject the run's bounded memory snapshot.
+        """Provide trusted static guidance about using memory.
 
-        Dynamic store reads here are unsuitable for durable workflow execution;
-        use `inject_memory=False` for Temporal or Prefect.
+        Stored memory is added separately as user-role context by
+        `before_model_request` so model-written content is not placed in the
+        instruction channel.
         """
+        return self._render_guidance()
+
+    def _render_guidance(self) -> str | None:
         guidance = _DEFAULT_GUIDANCE if self.guidance is None else self.guidance
+        if not guidance:
+            return None
+        return render_memory_prompt(
+            '',
+            [],
+            agent_name=self.agent_name,
+            guidance=guidance,
+            max_lines=self.max_lines,
+            max_tokens=self.max_tokens,
+        )
+
+    async def before_model_request(
+        self,
+        ctx: RunContext[AgentDepsT],
+        request_context: ModelRequestContext,
+    ) -> ModelRequestContext:
+        """Add a bounded memory snapshot to only the current user request."""
+        self._remove_previous_injection(request_context.messages)
         if not self.inject_memory:
-            if not guidance:
-                return None
-            return render_memory_prompt(
-                '',
-                [],
-                agent_name=self.agent_name,
-                guidance=guidance,
-                max_lines=self.max_lines,
-                max_tokens=self.max_tokens,
-            )
+            return request_context
 
-        async def memory_section(ctx: RunContext[AgentDepsT]) -> str | None:
-            store, scope = self.resolve_scope(ctx)
-            scope_hash = hashlib.sha256(scope.encode()).hexdigest()[:16]
-            with ctx.tracer.start_as_current_span(
-                'memory.inject', record_exception=False, set_status_on_exception=False
-            ) as span:
-                if span.is_recording():
-                    span.set_attributes(
-                        {
-                            'memory.backend': type(store).__name__,
-                            'memory.scope_hash': scope_hash,
-                        }
-                    )
-                try:
-                    main_path = f'{scope}/{MAIN_FILENAME}'
-                    main = await store.read(main_path, max_chars=self.max_memory_size)
-                    subfiles, files_truncated = await list_subfiles(
-                        store,
-                        scope,
-                        limit=injection_listing_limit(self.max_tokens),
-                    )
-                except Exception as exc:
-                    if span.is_recording():
-                        span.set_attributes(
-                            {
-                                'memory.outcome': 'error',
-                                'memory.exception_type': type(exc).__name__,
-                            }
-                        )
-                    if self.injection_errors == 'raise':
-                        raise
-                    return None
-
-                suppress_main = (
-                    main is not None
-                    and self._seen_main_versions.get(main_path) == main.version
-                    and main_path in self._seen_main_versions
+        store, scope = self.resolve_scope(ctx)
+        scope_hash = hashlib.sha256(scope.encode()).hexdigest()[:16]
+        with ctx.tracer.start_as_current_span(
+            'memory.inject', record_exception=False, set_status_on_exception=False
+        ) as span:
+            if span.is_recording():
+                span.set_attributes(
+                    {
+                        'memory.backend': type(store).__name__,
+                        'memory.scope_hash': scope_hash,
+                    }
                 )
-                main_content = '' if main is None or suppress_main else main.content
-                if main is None and not subfiles and not files_truncated:
-                    empty_guidance = '' if self.guidance == '' else _EMPTY_GUIDANCE
-                    rendered = (
-                        render_memory_prompt(
-                            '',
-                            [],
-                            agent_name=self.agent_name,
-                            guidance=empty_guidance,
-                            max_lines=self.max_lines,
-                            max_tokens=self.max_tokens,
-                            files_truncated=files_truncated,
-                        )
-                        if empty_guidance
-                        else ''
-                    )
-                else:
-                    rendered = render_memory_prompt(
-                        main_content,
-                        subfiles,
-                        agent_name=self.agent_name,
-                        guidance=guidance,
-                        max_lines=self.max_lines,
-                        max_tokens=self.max_tokens,
-                        main_truncated=main is not None and main.truncated,
-                        files_truncated=files_truncated,
-                    )
-                if main is not None:
-                    self.record_main_version(main_path, main.version)
+            try:
+                main_path = f'{scope}/{MAIN_FILENAME}'
+                main = await store.read(main_path, max_chars=self.max_memory_size)
+                subfiles, files_truncated = await list_subfiles(
+                    store,
+                    scope,
+                    limit=injection_listing_limit(self.max_tokens),
+                )
+            except Exception as exc:
                 if span.is_recording():
                     span.set_attributes(
                         {
-                            'memory.outcome': 'ok',
-                            'memory.main_chars': len(main_content),
-                            'memory.files': len(subfiles),
-                            'memory.files_truncated': files_truncated,
-                            'memory.main_truncated': main is not None and main.truncated,
-                            'memory.injected_chars': len(rendered),
-                            'memory.main_suppressed': suppress_main,
+                            'memory.outcome': 'error',
+                            'memory.exception_type': type(exc).__name__,
                         }
                     )
-                return rendered or None
+                if self.injection_errors == 'raise':
+                    raise
+                return request_context
 
-        return memory_section
+            main_content = '' if main is None else main.content
+            rendered = ''
+            guidance = self._render_guidance()
+            content_budget = (
+                self.max_tokens * 4 - len(guidance or '') - len(_MEMORY_DATA_PREFIX) - len(_MEMORY_DATA_SUFFIX)
+            )
+            if content_budget > 0 and (main_content or subfiles or files_truncated):
+                rendered = render_memory_prompt(
+                    main_content,
+                    subfiles,
+                    agent_name=self.agent_name,
+                    guidance='',
+                    max_lines=self.max_lines,
+                    max_tokens=max(1, content_budget // 4),
+                    main_truncated=main is not None and main.truncated,
+                    files_truncated=files_truncated,
+                )[:content_budget]
+                rendered = f'{_MEMORY_DATA_PREFIX}{rendered}{_MEMORY_DATA_SUFFIX}'
+                part = UserPromptPart([TextContent(rendered, metadata=_MEMORY_PART_METADATA)])
+                latest = request_context.messages[-1]
+                if not isinstance(latest, ModelRequest):  # pragma: no cover - guaranteed by the agent graph
+                    raise RuntimeError('model request history must end with a ModelRequest')
+                request_context.messages[-1] = replace(latest, parts=[*latest.parts, part])
+            if span.is_recording():
+                span.set_attributes(
+                    {
+                        'memory.outcome': 'ok',
+                        'memory.main_chars': len(main_content),
+                        'memory.files': len(subfiles),
+                        'memory.files_truncated': files_truncated,
+                        'memory.main_truncated': main is not None and main.truncated,
+                        'memory.injected_chars': len(rendered),
+                    }
+                )
+        return request_context
+
+    def _remove_previous_injection(self, messages: list[ModelMessage]) -> None:
+        for index, message in enumerate(messages):
+            if not isinstance(message, ModelRequest):
+                continue
+            parts: list[ModelRequestPart] = []
+            changed = False
+            for part in message.parts:
+                if not isinstance(part, UserPromptPart) or isinstance(part.content, str):
+                    parts.append(part)
+                    continue
+                content = [
+                    item
+                    for item in part.content
+                    if not (isinstance(item, TextContent) and item.metadata == _MEMORY_PART_METADATA)
+                ]
+                if len(content) == len(part.content):
+                    parts.append(part)
+                else:
+                    changed = True
+                    if content:
+                        parts.append(replace(part, content=content))
+            if changed:
+                messages[index] = replace(message, parts=parts)
 
     @classmethod
     def from_spec(
