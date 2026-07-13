@@ -261,8 +261,23 @@ class TestSqliteMemoryStore:
         await store.write('userX1/main/MEMORY.md', 'b')
         assert await store.list_paths('user_1/') == ['user_1/main/MEMORY.md']
 
-    def test_satisfies_protocol(self) -> None:
-        assert isinstance(SqliteMemoryStore(database=':memory:'), MemoryStore)
+    def test_satisfies_protocol(self, tmp_path: Path) -> None:
+        assert isinstance(SqliteMemoryStore(database=tmp_path / 'memory.db'), MemoryStore)
+
+    @pytest.mark.parametrize('bad', [':memory:', ''])
+    def test_rejects_in_memory_database(self, bad: str) -> None:
+        # Per-call connections would each see a fresh empty in-memory database.
+        with pytest.raises(ValueError, match='InMemoryStore'):
+            SqliteMemoryStore(database=bad)
+
+    async def test_prefix_listing_is_case_sensitive(self, tmp_path: Path) -> None:
+        # SQLite LIKE is case-insensitive for ASCII by default -- a LIKE-based
+        # listing would leak `alice/` paths to the `Alice/` tenant.
+        store = SqliteMemoryStore(database=tmp_path / 'memory.db')
+        await store.write('Alice/main/MEMORY.md', 'a')
+        await store.write('alice/main/MEMORY.md', 'b')
+        assert await store.list_paths('Alice/') == ['Alice/main/MEMORY.md']
+        assert await store.list_paths('alice/') == ['alice/main/MEMORY.md']
 
 
 @dataclass
@@ -537,9 +552,14 @@ class TestMemoryCapability:
         assert isinstance(capability.store, FileStore)
         assert capability.agent_name == 'bot'
 
-    def test_from_spec_sqlite_backend(self, tmp_path: Path) -> None:
-        capability = Memory.from_spec(backend='sqlite', database=str(tmp_path / 'mem.db'))
+    async def test_from_spec_sqlite_backend_honours_database_path(self, tmp_path: Path) -> None:
+        database = tmp_path / 'mem.db'
+        capability = Memory.from_spec(backend='sqlite', database=str(database))
         assert isinstance(capability.store, SqliteMemoryStore)
+        await capability.store.write('main/MEMORY.md', '- a fact')
+        assert database.is_file()
+        # A fresh store on the same path sees the data -- the configured path was honoured.
+        assert await SqliteMemoryStore(database=database).read('main/MEMORY.md') == '- a fact'
 
     def test_from_spec_unknown_backend_raises(self) -> None:
         with pytest.raises(ValueError, match='unknown backend'):

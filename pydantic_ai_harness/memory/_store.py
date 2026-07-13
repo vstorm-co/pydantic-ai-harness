@@ -171,16 +171,13 @@ class FileStore:
 _MEMORY_SCHEMA = 'CREATE TABLE IF NOT EXISTS memory_files (path TEXT PRIMARY KEY, content TEXT NOT NULL)'
 
 
-def _escape_like_prefix(prefix: str) -> str:
-    r"""Escape LIKE wildcards in a listing prefix (scope segments may contain `_`)."""
-    return prefix.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
-
-
 class SqliteMemoryStore:
     """SQLite-backed store: a single file holds every memory across namespaces.
 
     Pass either `database=` (path; connections opened short-lived per call,
     with WAL enabled) or `connection=` (caller-owned `sqlite3.Connection`).
+    `database=':memory:'` is rejected -- every per-call connection would get a
+    fresh empty database; use `InMemoryStore` or a caller-owned connection.
     A caller-owned connection **must** be created with
     `check_same_thread=False` -- store methods dispatch SQL onto worker
     threads via `anyio.to_thread`, so the stdlib default raises
@@ -201,6 +198,11 @@ class SqliteMemoryStore:
     ) -> None:
         if (database is None) == (connection is None):
             raise ValueError('provide exactly one of `database=` or `connection=`')
+        if database is not None and str(database) in ('', ':memory:'):
+            raise ValueError(
+                'an in-memory SQLite database does not work with per-call connections -- '
+                'use `InMemoryStore`, or pass a caller-owned `connection=`'
+            )
         self._database = database
         self._connection = connection
         self._schema_ready = False
@@ -265,9 +267,13 @@ class SqliteMemoryStore:
 
     def _sync_list_paths(self, prefix: str) -> list[str]:
         def op(connection: sqlite3.Connection) -> list[str]:
+            # substr comparison, not LIKE: SQLite LIKE is case-insensitive for
+            # ASCII by default, which would leak listings across case-variant
+            # namespaces (`Alice/` vs `alice/`); it also treats `%`/`_` as
+            # wildcards, and scope segments may legally contain `_`.
             rows = connection.execute(
-                "SELECT path FROM memory_files WHERE path LIKE ? ESCAPE '\\' ORDER BY path",
-                (f'{_escape_like_prefix(prefix)}%',),
+                'SELECT path FROM memory_files WHERE substr(path, 1, length(?1)) = ?1 ORDER BY path',
+                (prefix,),
             ).fetchall()
             return [str(row[0]) for row in rows]
 
