@@ -271,9 +271,11 @@ class SqliteMemoryStore:
             # ASCII by default, which would leak listings across case-variant
             # namespaces (`Alice/` vs `alice/`); it also treats `%`/`_` as
             # wildcards, and scope segments may legally contain `_`.
+            # Plain qmark placeholders: mixing numbered `?1` with a parameter
+            # sequence is deprecated on 3.12 and an error on 3.14.
             rows = connection.execute(
-                'SELECT path FROM memory_files WHERE substr(path, 1, length(?1)) = ?1 ORDER BY path',
-                (prefix,),
+                'SELECT path FROM memory_files WHERE substr(path, 1, length(?)) = ? ORDER BY path',
+                (prefix, prefix),
             ).fetchall()
             return [str(row[0]) for row in rows]
 
