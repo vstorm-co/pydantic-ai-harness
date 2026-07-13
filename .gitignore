@@ -3,6 +3,11 @@
 .DS_Store
 .agents/settings.local.json
 .agents/skills/branch-context/
+# .agents/ (aka .claude via the symlink) is Claude Code config. Most of it is
+# per-developer, but the agents/ dir holds shared, committed agents such as the
+# docs-parity-reviewer -- keep it tracked.
+!.agents/agents/
+!.claude/agents/
 AGENTS.local.md
 CLAUDE.local.md
 LOCAL_WORKTREES.md
