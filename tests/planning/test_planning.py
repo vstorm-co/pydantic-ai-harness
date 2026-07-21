@@ -192,6 +192,13 @@ class TestRenderers:
         cancelled_only = render_summary([PlanItem(content='a', status=TaskStatus.cancelled)], subtasks=False)
         assert 'All steps are completed' not in cancelled_only
 
+    def test_render_summary_blocked_suppresses_all_done_note(self) -> None:
+        items = [
+            PlanItem(content='a', status=TaskStatus.completed),
+            PlanItem(content='b', status=TaskStatus.blocked),
+        ]
+        assert 'All steps are completed' not in render_summary(items, subtasks=True)
+
     def test_status_icon_all(self) -> None:
         assert status_icon(TaskStatus.pending) == '[ ]'
         assert status_icon(TaskStatus.in_progress) == '[~]'
@@ -233,6 +240,17 @@ class TestGraphHelpers:
 
     def test_validate_hierarchy(self) -> None:
         assert validate_hierarchy([PlanItem(id='a', content='A'), PlanItem(id='b', content='B', parent_id='a')]) is None
+        # Valid multi-dependency plan (no cycle) -- the DFS steps past a clean dependency.
+        assert (
+            validate_hierarchy(
+                [
+                    PlanItem(id='a', content='A', depends_on=['b', 'c']),
+                    PlanItem(id='b', content='B'),
+                    PlanItem(id='c', content='C'),
+                ]
+            )
+            is None
+        )
         dup = validate_hierarchy([PlanItem(id='x', content='A'), PlanItem(id='x', content='B')])
         assert dup is not None and 'Duplicate step ids' in dup
         dangling = validate_hierarchy([PlanItem(id='a', content='A', parent_id='ghost')])
@@ -241,6 +259,12 @@ class TestGraphHelpers:
             [PlanItem(id='a', content='A', parent_id='b'), PlanItem(id='b', content='B', parent_id='a')]
         )
         assert cycle is not None and 'parent cycle' in cycle
+        bad_dep = validate_hierarchy([PlanItem(id='a', content='A', depends_on=['ghost'])])
+        assert bad_dep is not None and 'depends on' in bad_dep
+        dep_cycle = validate_hierarchy(
+            [PlanItem(id='a', content='A', depends_on=['b']), PlanItem(id='b', content='B', depends_on=['a'])]
+        )
+        assert dep_cycle is not None and 'dependency cycle' in dep_cycle
 
 
 # --- Toolset: base tools ----------------------------------------------------
@@ -284,6 +308,13 @@ class TestWritePlan:
         ts = _toolset(subtasks=True, store=store)
         result = await ts.write_plan(_ctx(), [PlanItem(id='x', content='A'), PlanItem(id='x', content='B')])
         assert result.startswith('Plan not updated:') and 'Duplicate step ids' in result
+        assert await store.get_items() == []
+
+    async def test_rejects_blocked_status_without_subtasks(self) -> None:
+        store = InMemoryPlanStore()
+        ts = _toolset(store=store)
+        result = await ts.write_plan(_ctx(), [PlanItem(content='A', status=TaskStatus.blocked)])
+        assert 'only valid with subtasks' in result
         assert await store.get_items() == []
 
 
@@ -488,6 +519,14 @@ class TestSubtaskTools:
         await ts.set_dependency(_ctx(), b.id, a.id)
         await ts.update_task_statuses(_ctx(), [PlanStatusUpdate(task_id=a.id, status=TaskStatus.completed)])
         assert (await store.get_item(b.id)).status is TaskStatus.pending  # type: ignore[union-attr]
+
+    async def test_regressing_prerequisite_reblocks_dependent(self) -> None:
+        store = InMemoryPlanStore()
+        ts = _toolset(subtasks=True, store=store)
+        a = await store.add_item(PlanItem(content='A', status=TaskStatus.completed))
+        b = await store.add_item(PlanItem(content='B', depends_on=[a.id]))
+        await ts.update_task_status(_ctx(), a.id, TaskStatus.in_progress)
+        assert (await store.get_item(b.id)).status is TaskStatus.blocked  # type: ignore[union-attr]
 
     async def test_get_available_tasks(self) -> None:
         store = InMemoryPlanStore()

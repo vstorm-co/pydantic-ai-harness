@@ -128,16 +128,19 @@ def is_blocked(items: list[PlanItem], item: PlanItem) -> bool:
 
 
 def validate_hierarchy(items: list[PlanItem]) -> str | None:
-    """Return an error message if the plan has duplicate ids or broken/cyclic parents, else `None`."""
+    """Return an error if the plan has duplicate ids, broken/cyclic parents, or bad dependencies, else `None`."""
     ids = [item.id for item in items]
     duplicates = sorted({id_ for id_ in ids if ids.count(id_) > 1})
     if duplicates:
         return f'Duplicate step ids: {", ".join(duplicates)}. Every step needs a unique id.'
     known = set(ids)
+    by_id = {item.id: item for item in items}
     for item in items:
         if item.parent_id is not None and item.parent_id not in known:
             return f"Step '{item.id}' has parent_id '{item.parent_id}', which is not in the plan."
-    by_id = {item.id: item for item in items}
+        for dep_id in item.depends_on:
+            if dep_id not in known:
+                return f"Step '{item.id}' depends on '{dep_id}', which is not in the plan."
     for item in items:
         seen: set[str] = set()
         parent_id = item.parent_id
@@ -147,6 +150,20 @@ def validate_hierarchy(items: list[PlanItem]) -> str | None:
             seen.add(parent_id)
             parent = by_id.get(parent_id)
             parent_id = parent.parent_id if parent is not None else None
+    color: dict[str, int] = {}
+
+    def has_dependency_cycle(node_id: str) -> bool:
+        color[node_id] = 1
+        for dep_id in by_id[node_id].depends_on:
+            state = color.get(dep_id, 0)
+            if state == 1 or (state == 0 and has_dependency_cycle(dep_id)):
+                return True
+        color[node_id] = 2
+        return False
+
+    for item in items:
+        if color.get(item.id, 0) == 0 and has_dependency_cycle(item.id):
+            return 'Plan has a dependency cycle.'
     return None
 
 
@@ -211,7 +228,7 @@ def render_summary(items: list[PlanItem], *, subtasks: bool) -> str:
     """Render the trailing `Summary:` block, with the all-done note when finished."""
     counts = _counts(items)
     summary = f'Summary: {status_counts_line(items, subtasks=subtasks)}'
-    active = counts[TaskStatus.pending] + counts[TaskStatus.in_progress]
+    active = counts[TaskStatus.pending] + counts[TaskStatus.in_progress] + counts[TaskStatus.blocked]
     if active == 0 and counts[TaskStatus.completed] > 0:
         summary += f'\n\n{_ALL_DONE_NOTE}'
     return summary
@@ -292,6 +309,9 @@ class PlanningToolset(FunctionToolset[AgentDepsT]):
         new_items: list[PlanItem] = []
         for item in items:
             new_items.append(item if self._subtasks else item.model_copy(update={'parent_id': None, 'depends_on': []}))
+        for item in new_items:
+            if not self._valid_status(item.status):
+                return f"Plan not updated: status '{item.status.value}' is only valid with subtasks enabled."
         if self._subtasks:
             error = validate_hierarchy(new_items)
             if error is not None:
@@ -332,15 +352,21 @@ class PlanningToolset(FunctionToolset[AgentDepsT]):
         item = await self._resolve(ctx).add_item(PlanItem(content=content, active_form=active_form))
         return f"Added step '{content}' with id: {item.id}"
 
-    async def _unblock_dependents(self, store: PlanStore) -> None:
-        """Return steps auto-blocked by `set_dependency` to `pending` once their prerequisites complete.
+    async def _sync_dependency_blocks(self, store: PlanStore) -> None:
+        """Keep dependency-driven `blocked` status in sync after a status change.
 
-        Only steps with a `depends_on` are touched, so a step manually set to
-        `blocked` is left as-is rather than silently reverted.
+        A step with dependencies is `blocked` while any prerequisite is incomplete
+        and returns to `pending` once they all complete. Steps without dependencies,
+        and completed/cancelled steps, are left untouched.
         """
         items = await store.get_items()
         for item in items:
-            if item.status is TaskStatus.blocked and item.depends_on and not is_blocked(items, item):
+            if not item.depends_on:
+                continue
+            blocked = is_blocked(items, item)
+            if blocked and item.status in (TaskStatus.pending, TaskStatus.in_progress):
+                await store.update_item(item.id, status=TaskStatus.blocked)
+            elif not blocked and item.status is TaskStatus.blocked:
                 await store.update_item(item.id, status=TaskStatus.pending)
 
     async def update_task_status(self, ctx: RunContext[AgentDepsT], task_id: str, status: TaskStatus) -> str:
@@ -362,7 +388,7 @@ class PlanningToolset(FunctionToolset[AgentDepsT]):
             return f"Cannot start '{item.content}': it has incomplete dependencies."
         await store.update_item(task_id, status=status)
         if self._subtasks:
-            await self._unblock_dependents(store)
+            await self._sync_dependency_blocks(store)
         return f"Updated step '{item.content}' status to '{status.value}'."
 
     async def update_task_statuses(self, ctx: RunContext[AgentDepsT], updates: list[PlanStatusUpdate]) -> str:
@@ -400,7 +426,7 @@ class PlanningToolset(FunctionToolset[AgentDepsT]):
             await store.update_item(item.id, status=status)
             lines.append(f'- [{item.id}] {item.content} -> {status.value}')
         if self._subtasks:
-            await self._unblock_dependents(store)
+            await self._sync_dependency_blocks(store)
         return f'Updated {len(resolved)} step(s):\n' + '\n'.join(lines)
 
     async def remove_task(self, ctx: RunContext[AgentDepsT], task_id: str) -> str:
