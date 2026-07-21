@@ -1,76 +1,437 @@
-"""Planning toolset: a single `write_plan` tool over a shared, per-run plan."""
+"""The `planning` toolset: whole-plan replacement plus granular step tools."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import Enum
+from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, Field
-from pydantic_ai.tools import AgentDepsT
+from pydantic_ai.tools import AgentDepsT, RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
+from pydantic_ai_harness.planning._types import PlanItem, PlanStatusUpdate, TaskStatus
 
-class TaskStatus(str, Enum):
-    """Lifecycle status of a single plan step."""
+if TYPE_CHECKING:
+    from pydantic_ai_harness.planning._capability import Planning
+    from pydantic_ai_harness.planning._store import PlanStore
 
-    pending = 'pending'
-    in_progress = 'in_progress'
-    completed = 'completed'
-    cancelled = 'cancelled'
+WRITE_PLAN_DESCRIPTION = """\
+Create or replace the entire plan. Pass the whole ordered list every time -- \
+including steps that are unchanged, completed, or cancelled -- so there are no \
+indices to track. Keep exactly one step `in_progress`. Call this first for \
+multi-step work, then again as you start and finish steps.\
+"""
 
+READ_PLAN_DESCRIPTION = """\
+Read the current plan: each step's id, content, and status, plus a progress \
+summary. Use it before granular edits (the ids come from here) and to check \
+what is left.\
+"""
 
-_STATUS_ICONS = {
+ADD_TASK_DESCRIPTION = """\
+Append one new `pending` step without replacing the plan. Prefer this over \
+write_plan when you only need to add a single step.\
+"""
+
+UPDATE_TASK_STATUS_DESCRIPTION = """\
+Update one step's status by id. Set `in_progress` when you START a step and \
+`completed` when it is fully done -- never mark work complete while tests fail \
+or the implementation is partial.\
+"""
+
+UPDATE_TASK_STATUSES_DESCRIPTION = """\
+Update several steps' statuses in one atomic call -- ideal for handing off from \
+a finished step to the next one. The whole batch is validated first: if any \
+entry is invalid nothing is applied and the errors are returned.\
+"""
+
+REMOVE_TASK_DESCRIPTION = """\
+Permanently delete a step by id -- use it for steps that are no longer relevant \
+or were created in error. To mark work done, use update_task_status instead.\
+"""
+
+ADD_SUBTASK_DESCRIPTION = """\
+Add a `pending` subtask under an existing step, creating a parent/child link. \
+Break a complex step into a handful of independently completable subtasks, and \
+complete them before completing the parent.\
+"""
+
+SET_DEPENDENCY_DESCRIPTION = """\
+Record that one step must wait for another to complete. The dependent step is \
+automatically marked `blocked` until its prerequisite is `completed`. \
+Self-dependencies, cycles, and duplicates are rejected.\
+"""
+
+GET_AVAILABLE_TASKS_DESCRIPTION = """\
+List the steps that can be worked on now -- those that are not completed, not \
+blocked, and have no incomplete dependencies. Use it to choose the next step \
+when dependencies are involved.\
+"""
+
+_ALL_DONE_NOTE = 'All steps are completed. Do NOT call read_plan again -- respond to the user with a summary instead.'
+_MULTI_IN_PROGRESS_NOTE = '\n\nNote: keep only one step in_progress at a time.'
+
+_ICONS = {
     TaskStatus.pending: '[ ]',
     TaskStatus.in_progress: '[~]',
     TaskStatus.completed: '[x]',
     TaskStatus.cancelled: '[-]',
+    TaskStatus.blocked: '[!]',
 }
 
 
-class PlanItem(BaseModel):
-    """A single step in the plan."""
-
-    content: str = Field(description='Imperative description of the step, e.g. "Add the database migration".')
-    status: TaskStatus = Field(default=TaskStatus.pending, description='Current status of this step.')
-
-
-@dataclass
-class PlanState:
-    """Mutable per-run plan storage shared between the toolset and the capability hook."""
-
-    items: list[PlanItem] = field(default_factory=list[PlanItem])
+def status_icon(status: TaskStatus) -> str:
+    """Return the one-glyph status marker for a step."""
+    return _ICONS[status]
 
 
 def render_plan(items: list[PlanItem]) -> str:
-    """Render the plan as a checklist with a one-line progress summary."""
+    """Render the compact classic checklist with a one-line progress summary."""
     if not items:
         return 'No plan yet.'
-    lines = [f'{i + 1}. {_STATUS_ICONS[item.status]} {item.content}' for i, item in enumerate(items)]
+    lines = [f'{index}. {status_icon(item.status)} {item.content}' for index, item in enumerate(items, 1)]
     completed = sum(1 for item in items if item.status is TaskStatus.completed)
     lines.append(f'({completed}/{len(items)} completed)')
     return '\n'.join(lines)
 
 
+def find_item(items: list[PlanItem], item_id: str) -> PlanItem | None:
+    """Return the step with `item_id` from a snapshot list, or `None`."""
+    return next((item for item in items if item.id == item_id), None)
+
+
+def has_cycle(items: list[PlanItem], item_id: str, depends_on_id: str) -> bool:
+    """Return whether making `item_id` depend on `depends_on_id` would form a cycle."""
+    by_id = {item.id: item for item in items}
+    visited: set[str] = set()
+
+    def visit(current: str) -> bool:
+        if current == item_id:
+            return True
+        if current in visited:
+            return False
+        visited.add(current)
+        node = by_id.get(current)
+        if node is not None:
+            return any(visit(dep) for dep in node.depends_on)
+        return False
+
+    return visit(depends_on_id)
+
+
+def is_blocked(items: list[PlanItem], item: PlanItem) -> bool:
+    """Return whether `item` has any dependency that is not yet completed."""
+    by_id = {node.id: node for node in items}
+    for dep_id in item.depends_on:
+        dep = by_id.get(dep_id)
+        if dep is not None and dep.status is not TaskStatus.completed:
+            return True
+    return False
+
+
+def render_flat(items: list[PlanItem], *, subtasks: bool) -> str:
+    """Render the detailed numbered list with ids, annotating parents/dependencies."""
+    lines = ['Current plan:']
+    for index, item in enumerate(items, 1):
+        lines.append(f'{index}. {status_icon(item.status)} [{item.id}] {item.content}')
+        if subtasks and item.parent_id:
+            lines.append(f'   (subtask of: {item.parent_id})')
+        if subtasks and item.depends_on:
+            lines.append(f'   (depends on: {", ".join(item.depends_on)})')
+    return '\n'.join(lines)
+
+
+def render_tree(items: list[PlanItem]) -> str:
+    """Render the plan as an indented parent/child tree."""
+    children: dict[str | None, list[PlanItem]] = {}
+    for item in items:
+        children.setdefault(item.parent_id, []).append(item)
+    lines = ['Current plan (hierarchical view):']
+    counter = [0]
+
+    def walk(parent_id: str | None, depth: int) -> None:
+        for item in children.get(parent_id, []):
+            counter[0] += 1
+            indent = '  ' * depth
+            lines.append(f'{indent}{counter[0]}. {status_icon(item.status)} [{item.id}] {item.content}')
+            if item.depends_on:
+                lines.append(f'{indent}   depends on: {", ".join(item.depends_on)}')
+            walk(item.id, depth + 1)
+
+    walk(None, 0)
+    return '\n'.join(lines)
+
+
+def _counts(items: list[PlanItem]) -> dict[TaskStatus, int]:
+    counts = {status: 0 for status in TaskStatus}
+    for item in items:
+        counts[item.status] += 1
+    return counts
+
+
+def status_counts_line(items: list[PlanItem], *, subtasks: bool) -> str:
+    """Render the `X completed, Y in progress, Z pending` status tally."""
+    counts = _counts(items)
+    parts = [f'{counts[TaskStatus.completed]} completed']
+    if subtasks and counts[TaskStatus.blocked] > 0:
+        parts.append(f'{counts[TaskStatus.blocked]} blocked')
+    parts.append(f'{counts[TaskStatus.in_progress]} in progress')
+    parts.append(f'{counts[TaskStatus.pending]} pending')
+    if counts[TaskStatus.cancelled] > 0:
+        parts.append(f'{counts[TaskStatus.cancelled]} cancelled')
+    return ', '.join(parts)
+
+
+def render_summary(items: list[PlanItem], *, subtasks: bool) -> str:
+    """Render the trailing `Summary:` block, with the all-done note when finished."""
+    counts = _counts(items)
+    summary = f'Summary: {status_counts_line(items, subtasks=subtasks)}'
+    active = counts[TaskStatus.pending] + counts[TaskStatus.in_progress]
+    if active == 0 and counts[TaskStatus.completed] > 0:
+        summary += f'\n\n{_ALL_DONE_NOTE}'
+    return summary
+
+
 class PlanningToolset(FunctionToolset[AgentDepsT]):
-    """Exposes a single `write_plan` tool that overwrites the shared `PlanState`."""
+    """Plan tools registered against a `Planning` capability's resolved store.
 
-    def __init__(self, state: PlanState) -> None:
-        super().__init__()
-        self._state = state
-        self.add_function(self.write_plan, name='write_plan')
+    `write_plan` (whole-plan replacement) is always present, alongside granular
+    `read_plan`, `add_task`, `update_task_status`, `update_task_statuses`, and
+    `remove_task`. When `enable_subtasks` is set, `add_subtask`, `set_dependency`,
+    and `get_available_tasks` are added and the `blocked` status becomes valid.
+    """
 
-    async def write_plan(self, items: list[PlanItem]) -> str:
-        """Create or replace the full task plan.
+    def __init__(self, capability: Planning[AgentDepsT]) -> None:
+        super().__init__(id='planning')
+        self._capability = capability
+        self._subtasks = capability.enable_subtasks
+        descriptions = capability.descriptions or {}
+        self.add_function(
+            self.write_plan, name='write_plan', description=descriptions.get('write_plan', WRITE_PLAN_DESCRIPTION)
+        )
+        if self._subtasks:
+            self.add_function(
+                self.read_plan_tree, name='read_plan', description=descriptions.get('read_plan', READ_PLAN_DESCRIPTION)
+            )
+        else:
+            self.add_function(
+                self.read_plan, name='read_plan', description=descriptions.get('read_plan', READ_PLAN_DESCRIPTION)
+            )
+        self.add_function(
+            self.add_task, name='add_task', description=descriptions.get('add_task', ADD_TASK_DESCRIPTION)
+        )
+        self.add_function(
+            self.update_task_status,
+            name='update_task_status',
+            description=descriptions.get('update_task_status', UPDATE_TASK_STATUS_DESCRIPTION),
+        )
+        self.add_function(
+            self.update_task_statuses,
+            name='update_task_statuses',
+            description=descriptions.get('update_task_statuses', UPDATE_TASK_STATUSES_DESCRIPTION),
+        )
+        self.add_function(
+            self.remove_task, name='remove_task', description=descriptions.get('remove_task', REMOVE_TASK_DESCRIPTION)
+        )
+        if self._subtasks:
+            self.add_function(
+                self.add_subtask,
+                name='add_subtask',
+                description=descriptions.get('add_subtask', ADD_SUBTASK_DESCRIPTION),
+            )
+            self.add_function(
+                self.set_dependency,
+                name='set_dependency',
+                description=descriptions.get('set_dependency', SET_DEPENDENCY_DESCRIPTION),
+            )
+            self.add_function(
+                self.get_available_tasks,
+                name='get_available_tasks',
+                description=descriptions.get('get_available_tasks', GET_AVAILABLE_TASKS_DESCRIPTION),
+            )
 
-        Pass the entire ordered plan every time -- including steps that are
-        unchanged, completed, or cancelled. Keep exactly one step `in_progress`.
-        Call this when you start and when you finish a step so your progress
-        stays visible.
+    def _resolve(self, ctx: RunContext[AgentDepsT]) -> PlanStore:
+        return self._capability.resolve_store(ctx)
+
+    def _valid_status(self, status: TaskStatus) -> bool:
+        return self._subtasks or status is not TaskStatus.blocked
+
+    async def write_plan(self, ctx: RunContext[AgentDepsT], items: list[PlanItem]) -> str:
+        """Create or replace the whole plan.
 
         Args:
+            ctx: Framework-provided run context.
             items: The complete ordered list of plan steps.
         """
-        self._state.items = list(items)
-        in_progress = sum(1 for item in items if item.status is TaskStatus.in_progress)
-        note = '' if in_progress <= 1 else '\n\nNote: keep only one step in_progress at a time.'
-        return f'Plan updated: {len(items)} step(s).\n\n{render_plan(self._state.items)}{note}'
+        store = self._resolve(ctx)
+        new_items: list[PlanItem] = []
+        for item in items:
+            new_items.append(item if self._subtasks else item.model_copy(update={'parent_id': None, 'depends_on': []}))
+        await store.set_items(new_items)
+        in_progress = sum(1 for item in new_items if item.status is TaskStatus.in_progress)
+        note = '' if in_progress <= 1 else _MULTI_IN_PROGRESS_NOTE
+        return f'Plan updated: {len(new_items)} step(s).\n\n{render_plan(new_items)}{note}'
+
+    async def read_plan(self, ctx: RunContext[AgentDepsT]) -> str:
+        """Read the current plan."""
+        items = await self._resolve(ctx).get_items()
+        if not items:
+            return 'No plan yet. Use write_plan to create one.'
+        return f'{render_flat(items, subtasks=False)}\n\n{render_summary(items, subtasks=False)}'
+
+    async def read_plan_tree(self, ctx: RunContext[AgentDepsT], hierarchical: bool = False) -> str:
+        """Read the current plan.
+
+        Args:
+            ctx: Framework-provided run context.
+            hierarchical: Render subtasks as an indented tree instead of a flat list.
+        """
+        items = await self._resolve(ctx).get_items()
+        if not items:
+            return 'No plan yet. Use write_plan to create one.'
+        body = render_tree(items) if hierarchical else render_flat(items, subtasks=True)
+        return f'{body}\n\n{render_summary(items, subtasks=True)}'
+
+    async def add_task(self, ctx: RunContext[AgentDepsT], content: str, active_form: str = '') -> str:
+        """Add one new pending step.
+
+        Args:
+            ctx: Framework-provided run context.
+            content: The step description in imperative form.
+            active_form: Optional present-continuous label, e.g. "Fix bug" -> "Fixing bug".
+        """
+        item = await self._resolve(ctx).add_item(PlanItem(content=content, active_form=active_form))
+        return f"Added step '{content}' with id: {item.id}"
+
+    async def update_task_status(self, ctx: RunContext[AgentDepsT], task_id: str, status: TaskStatus) -> str:
+        """Update one step's status by id.
+
+        Args:
+            ctx: Framework-provided run context.
+            task_id: Id of the step to update.
+            status: New status.
+        """
+        store = self._resolve(ctx)
+        if not self._valid_status(status):
+            return "Invalid status 'blocked': subtasks are not enabled on this capability."
+        items = await store.get_items()
+        item = find_item(items, task_id)
+        if item is None:
+            return f"Step with id '{task_id}' not found."
+        if self._subtasks and status is TaskStatus.in_progress and is_blocked(items, item):
+            return f"Cannot start '{item.content}': it has incomplete dependencies."
+        await store.update_item(task_id, status=status)
+        return f"Updated step '{item.content}' status to '{status.value}'."
+
+    async def update_task_statuses(self, ctx: RunContext[AgentDepsT], updates: list[PlanStatusUpdate]) -> str:
+        """Update several steps' statuses atomically.
+
+        Args:
+            ctx: Framework-provided run context.
+            updates: The `{task_id, status}` entries to apply.
+        """
+        store = self._resolve(ctx)
+        if not updates:
+            return 'No updates provided.'
+        items = await store.get_items()
+        errors: list[str] = []
+        resolved: list[tuple[PlanItem, TaskStatus]] = []
+        for update in updates:
+            if not self._valid_status(update.status):
+                errors.append(f"Invalid status 'blocked' for '{update.task_id}': subtasks are not enabled.")
+                continue
+            item = find_item(items, update.task_id)
+            if item is None:
+                errors.append(f"Step with id '{update.task_id}' not found.")
+                continue
+            if self._subtasks and update.status is TaskStatus.in_progress and is_blocked(items, item):
+                errors.append(f"Cannot start '{item.content}': it has incomplete dependencies.")
+                continue
+            resolved.append((item, update.status))
+        if errors:
+            return 'No changes applied. Errors:\n' + '\n'.join(f'- {error}' for error in errors)
+        lines: list[str] = []
+        for item, status in resolved:
+            await store.update_item(item.id, status=status)
+            lines.append(f'- [{item.id}] {item.content} -> {status.value}')
+        return f'Updated {len(resolved)} step(s):\n' + '\n'.join(lines)
+
+    async def remove_task(self, ctx: RunContext[AgentDepsT], task_id: str) -> str:
+        """Remove a step by id.
+
+        Args:
+            ctx: Framework-provided run context.
+            task_id: Id of the step to remove.
+        """
+        store = self._resolve(ctx)
+        item = await store.get_item(task_id)
+        if item is None:
+            return f"Step with id '{task_id}' not found."
+        await store.remove_item(task_id)
+        return f"Removed step '{item.content}' (id: {task_id})."
+
+    async def add_subtask(
+        self, ctx: RunContext[AgentDepsT], parent_id: str, content: str, active_form: str = ''
+    ) -> str:
+        """Add a subtask under an existing step.
+
+        Args:
+            ctx: Framework-provided run context.
+            parent_id: Id of the parent step.
+            content: The subtask description in imperative form.
+            active_form: Optional present-continuous label.
+        """
+        store = self._resolve(ctx)
+        parent = await store.get_item(parent_id)
+        if parent is None:
+            return f"Parent step with id '{parent_id}' not found."
+        item = await store.add_item(PlanItem(content=content, active_form=active_form, parent_id=parent_id))
+        return f"Added subtask '{content}' with id: {item.id} (parent: {parent_id})"
+
+    async def set_dependency(self, ctx: RunContext[AgentDepsT], task_id: str, depends_on_id: str) -> str:
+        """Make one step depend on another.
+
+        Args:
+            ctx: Framework-provided run context.
+            task_id: The step that depends on another (it may become blocked).
+            depends_on_id: The prerequisite that must complete first.
+        """
+        store = self._resolve(ctx)
+        items = await store.get_items()
+        item = find_item(items, task_id)
+        if item is None:
+            return f"Step with id '{task_id}' not found."
+        dependency = find_item(items, depends_on_id)
+        if dependency is None:
+            return f"Dependency step with id '{depends_on_id}' not found."
+        if task_id == depends_on_id:
+            return 'A step cannot depend on itself.'
+        if has_cycle(items, task_id, depends_on_id):
+            return 'Cannot add dependency: it would create a cycle.'
+        if depends_on_id in item.depends_on:
+            return 'Dependency already exists.'
+        new_depends_on = [*item.depends_on, depends_on_id]
+        if dependency.status is not TaskStatus.completed and item.status not in (
+            TaskStatus.completed,
+            TaskStatus.blocked,
+        ):
+            await store.update_item(task_id, depends_on=new_depends_on, status=TaskStatus.blocked)
+            return (
+                f"Added dependency: '{item.content}' now depends on '{dependency.content}'. Step automatically blocked."
+            )
+        await store.update_item(task_id, depends_on=new_depends_on)
+        return f"Added dependency: '{item.content}' now depends on '{dependency.content}'."
+
+    async def get_available_tasks(self, ctx: RunContext[AgentDepsT]) -> str:
+        """List steps that can be worked on now (no incomplete dependencies)."""
+        items = await self._resolve(ctx).get_items()
+        available = [
+            item
+            for item in items
+            if item.status not in (TaskStatus.completed, TaskStatus.blocked, TaskStatus.cancelled)
+            and not is_blocked(items, item)
+        ]
+        if not available:
+            return 'No available steps. All steps are either completed, cancelled, or blocked.'
+        lines = ['Available steps (no blocking dependencies):']
+        for index, item in enumerate(available, 1):
+            lines.append(f'{index}. {status_icon(item.status)} [{item.id}] {item.content}')
+        return '\n'.join(lines)
