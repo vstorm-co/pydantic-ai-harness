@@ -47,7 +47,7 @@ print(result.output)
 | `read_plan()` | Read the current plan with step ids and a progress summary. |
 | `add_task(content, active_form)` | Append a single `pending` step. |
 | `update_task_status(task_id, status)` | Move one step between statuses by id. |
-| `update_task_statuses(updates)` | Apply several status changes atomically (all-or-nothing). |
+| `update_task_statuses(updates)` | Apply several status changes in one call, validated all-or-nothing. |
 | `remove_task(task_id)` | Delete a step by id. |
 
 Each step is a `content` string, an optional present-continuous `active_form` label, and a `status` (`pending`, `in_progress`, `completed`, `cancelled`). The convention -- stated in the guidance and the tools' replies -- is to keep exactly one step `in_progress`.

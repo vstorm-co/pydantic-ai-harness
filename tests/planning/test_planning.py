@@ -303,6 +303,23 @@ class TestWritePlan:
         stored = (await store.get_items())[1]
         assert stored.parent_id == 'x'
 
+    async def test_reconciles_blocked_status(self) -> None:
+        store = InMemoryPlanStore()
+        ts = _toolset(subtasks=True, store=store)
+        # A pending step with an incomplete prerequisite is reconciled to `blocked`;
+        # a `blocked` step whose prerequisite is already done is reconciled to `pending`.
+        await ts.write_plan(
+            _ctx(),
+            [
+                PlanItem(id='a', content='A'),
+                PlanItem(id='b', content='B', depends_on=['a']),
+                PlanItem(id='c', content='C', status=TaskStatus.completed),
+                PlanItem(id='d', content='D', status=TaskStatus.blocked, depends_on=['c']),
+            ],
+        )
+        assert (await store.get_item('b')).status is TaskStatus.blocked  # type: ignore[union-attr]
+        assert (await store.get_item('d')).status is TaskStatus.pending  # type: ignore[union-attr]
+
     async def test_subtasks_rejects_bad_hierarchy(self) -> None:
         store = InMemoryPlanStore()
         ts = _toolset(subtasks=True, store=store)
@@ -448,6 +465,23 @@ class TestRemoveTask:
         item = await store.add_item(PlanItem(content='A'))
         assert 'Removed step' in await ts.remove_task(_ctx(), item.id)
         assert 'not found' in await ts.remove_task(_ctx(), item.id)
+
+    async def test_cascades_subtasks_and_cleans_dependencies(self) -> None:
+        store = InMemoryPlanStore()
+        ts = _toolset(subtasks=True, store=store)
+        await store.add_item(PlanItem(id='p', content='Parent'))
+        await store.add_item(PlanItem(id='c', content='Child', parent_id='p'))
+        await store.add_item(PlanItem(id='d', content='Dependent', depends_on=['p'], status=TaskStatus.blocked))
+        # An unrelated, manually-blocked step must be left untouched.
+        await store.add_item(PlanItem(id='e', content='Unrelated', status=TaskStatus.blocked))
+        result = await ts.remove_task(_ctx(), 'p')
+        assert '1 subtask(s)' in result
+        # Parent and its child are gone; the dangling dependency is dropped and the
+        # dependent is unblocked since it no longer waits on anything.
+        assert [i.id for i in await store.get_items()] == ['d', 'e']
+        assert (await store.get_item('d')).depends_on == []  # type: ignore[union-attr]
+        assert (await store.get_item('d')).status is TaskStatus.pending  # type: ignore[union-attr]
+        assert (await store.get_item('e')).status is TaskStatus.blocked  # type: ignore[union-attr]
 
 
 # --- Toolset: subtask tools -------------------------------------------------

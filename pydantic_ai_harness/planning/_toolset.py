@@ -38,9 +38,9 @@ or the implementation is partial.\
 """
 
 UPDATE_TASK_STATUSES_DESCRIPTION = """\
-Update several steps' statuses in one atomic call -- ideal for handing off from \
-a finished step to the next one. The whole batch is validated first: if any \
-entry is invalid nothing is applied and the errors are returned.\
+Update several steps' statuses in one call -- ideal for handing off from a \
+finished step to the next one. The whole batch is validated first: if any entry \
+is invalid nothing is applied and the errors are returned.\
 """
 
 REMOVE_TASK_DESCRIPTION = """\
@@ -317,6 +317,9 @@ class PlanningToolset(FunctionToolset[AgentDepsT]):
             if error is not None:
                 return f'Plan not updated: {error}'
         await store.set_items(new_items)
+        if self._subtasks:
+            await self._sync_dependency_blocks(store)
+            new_items = await store.get_items()
         in_progress = sum(1 for item in new_items if item.status is TaskStatus.in_progress)
         note = '' if in_progress <= 1 else _MULTI_IN_PROGRESS_NOTE
         return f'Plan updated: {len(new_items)} step(s).\n\n{render_plan(new_items)}{note}'
@@ -392,7 +395,11 @@ class PlanningToolset(FunctionToolset[AgentDepsT]):
         return f"Updated step '{item.content}' status to '{status.value}'."
 
     async def update_task_statuses(self, ctx: RunContext[AgentDepsT], updates: list[PlanStatusUpdate]) -> str:
-        """Update several steps' statuses atomically.
+        """Update several steps' statuses in one call.
+
+        The batch is validated as a unit -- if any entry is invalid, nothing is
+        applied. Valid updates are then written to the store sequentially (the
+        store, not this method, decides how each write is committed).
 
         Args:
             ctx: Framework-provided run context.
@@ -441,7 +448,42 @@ class PlanningToolset(FunctionToolset[AgentDepsT]):
         if item is None:
             return f"Step with id '{task_id}' not found."
         await store.remove_item(task_id)
-        return f"Removed step '{item.content}' (id: {task_id})."
+        subtasks_removed = await self._cleanup_after_removal(store, task_id) if self._subtasks else 0
+        extra = f' and {subtasks_removed} subtask(s)' if subtasks_removed else ''
+        return f"Removed step '{item.content}' (id: {task_id}){extra}."
+
+    async def _cleanup_after_removal(self, store: PlanStore, removed_id: str) -> int:
+        """Cascade-remove the deleted step's descendants and drop dangling `depends_on` refs.
+
+        Returns the number of descendant subtasks removed. Prevents orphaned
+        subtasks and stale dependencies (which `is_blocked` would treat as met).
+        """
+        items = await store.get_items()
+        children: dict[str, list[str]] = {}
+        for item in items:
+            if item.parent_id is not None:
+                children.setdefault(item.parent_id, []).append(item.id)
+        descendants: list[str] = []
+        stack = list(children.get(removed_id, []))
+        while stack:
+            current = stack.pop()
+            descendants.append(current)
+            stack.extend(children.get(current, []))
+        for descendant_id in descendants:
+            await store.remove_item(descendant_id)
+        gone = {removed_id, *descendants}
+        stripped: list[str] = []
+        for item in await store.get_items():
+            if any(dep in gone for dep in item.depends_on):
+                await store.update_item(item.id, depends_on=[dep for dep in item.depends_on if dep not in gone])
+                stripped.append(item.id)
+        # Only unblock steps whose dependencies we just changed -- removing a
+        # prerequisite can free a dependent, but must not touch unrelated blocks.
+        remaining = await store.get_items()
+        for item in remaining:
+            if item.id in stripped and item.status is TaskStatus.blocked and not is_blocked(remaining, item):
+                await store.update_item(item.id, status=TaskStatus.pending)
+        return len(descendants)
 
     async def add_subtask(
         self, ctx: RunContext[AgentDepsT], parent_id: str, content: str, active_form: str = ''

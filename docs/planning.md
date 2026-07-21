@@ -44,7 +44,7 @@ print(result.output)
 | `read_plan()` | Read the current plan with step ids and a progress summary. |
 | `add_task(content, active_form)` | Append a single `pending` step. |
 | `update_task_status(task_id, status)` | Move one step between statuses by id. |
-| `update_task_statuses(updates)` | Apply several status changes atomically. |
+| `update_task_statuses(updates)` | Apply several status changes in one call, validated all-or-nothing. |
 | `remove_task(task_id)` | Delete a step by id. |
 
 With `enable_subtasks=True` you also get `add_subtask`, `set_dependency`, and `get_available_tasks`, plus the `blocked` status and a `hierarchical` view in `read_plan`.
