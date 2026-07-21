@@ -173,6 +173,7 @@ class TestPostgresStore:
 
     async def test_update_found_and_missing(self) -> None:
         store = PostgresPlanStore(FakePool())
+        await store.add_item(_item('first'))
         item = await store.add_item(_item('x', depends_on=['d']))
         updated = await store.update_item(item.id, status=TaskStatus.completed, parent_id='p')
         assert updated is not None and updated.status is TaskStatus.completed and updated.parent_id == 'p'

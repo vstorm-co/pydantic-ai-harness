@@ -7,7 +7,10 @@ own `redis.asyncio.Redis` client (which already satisfies this protocol) at
 construction.
 
 The whole plan for a session is stored as one JSON document under a single key.
-Every write is a single `SET`, so operations are individually atomic; the
+`set_items` is a single `SET` and so is atomic; the granular operations
+(`add_item`, `update_item`, `remove_item`) are read-modify-write, so two tasks
+mutating the same session concurrently can clobber each other. Drive one session
+from one task, or use `set_items` if you need atomic whole-plan writes. The
 `{session}` hash-tag keeps the key on one slot under Redis Cluster.
 """
 

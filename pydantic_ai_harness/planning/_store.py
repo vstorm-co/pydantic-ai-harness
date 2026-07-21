@@ -38,7 +38,14 @@ class PlanStore(Protocol):
         ...  # pragma: no cover
 
     async def set_items(self, items: list[PlanItem]) -> None:
-        """Replace the whole list with `items`."""
+        """Replace the whole list with `items`.
+
+        This is a bulk replacement and does not emit `PlanEvent`s -- so the
+        `write_plan` tool, which calls it, is event-silent. Applications that
+        render off events should also read the plan after a run, or steer the
+        model toward the granular tools (`add_task`, `update_task_status`, ...),
+        which do emit.
+        """
         ...  # pragma: no cover
 
     async def get_item(self, item_id: str) -> PlanItem | None:

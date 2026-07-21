@@ -301,6 +301,18 @@ class PlanningToolset(FunctionToolset[AgentDepsT]):
         item = await self._resolve(ctx).add_item(PlanItem(content=content, active_form=active_form))
         return f"Added step '{content}' with id: {item.id}"
 
+    async def _unblock_dependents(self, store: PlanStore) -> None:
+        """Clear `blocked` from any step whose dependencies are now all completed.
+
+        Called after a status change so a step auto-blocked by `set_dependency`
+        returns to `pending` once its prerequisites complete, matching the
+        documented behaviour ("blocked until its prerequisite completes").
+        """
+        items = await store.get_items()
+        for item in items:
+            if item.status is TaskStatus.blocked and not is_blocked(items, item):
+                await store.update_item(item.id, status=TaskStatus.pending)
+
     async def update_task_status(self, ctx: RunContext[AgentDepsT], task_id: str, status: TaskStatus) -> str:
         """Update one step's status by id.
 
@@ -319,6 +331,8 @@ class PlanningToolset(FunctionToolset[AgentDepsT]):
         if self._subtasks and status is TaskStatus.in_progress and is_blocked(items, item):
             return f"Cannot start '{item.content}': it has incomplete dependencies."
         await store.update_item(task_id, status=status)
+        if self._subtasks:
+            await self._unblock_dependents(store)
         return f"Updated step '{item.content}' status to '{status.value}'."
 
     async def update_task_statuses(self, ctx: RunContext[AgentDepsT], updates: list[PlanStatusUpdate]) -> str:
@@ -352,6 +366,8 @@ class PlanningToolset(FunctionToolset[AgentDepsT]):
         for item, status in resolved:
             await store.update_item(item.id, status=status)
             lines.append(f'- [{item.id}] {item.content} -> {status.value}')
+        if self._subtasks:
+            await self._unblock_dependents(store)
         return f'Updated {len(resolved)} step(s):\n' + '\n'.join(lines)
 
     async def remove_task(self, ctx: RunContext[AgentDepsT], task_id: str) -> str:

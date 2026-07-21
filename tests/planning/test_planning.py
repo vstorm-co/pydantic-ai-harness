@@ -117,7 +117,8 @@ class TestEventEmitter:
     def test_off(self) -> None:
         emitter = PlanEventEmitter()
 
-        def cb(event: PlanEvent) -> None: ...
+        def cb(event: PlanEvent) -> None:  # pragma: no cover - registered then removed, never fired
+            ...
 
         emitter.on(PlanEventType.created, cb)
         assert emitter.off(PlanEventType.created, cb) is True
@@ -417,6 +418,29 @@ class TestSubtaskTools:
         assert 'already exists' in await ts.set_dependency(_ctx(), b.id, a.id)
         # cycle: a already depends on b (via b->a? no). Make a depend on b, then b->a would cycle
         assert 'cycle' in await ts.set_dependency(_ctx(), a.id, b.id)
+
+    async def test_completing_prerequisite_unblocks_dependent(self) -> None:
+        store = InMemoryPlanStore()
+        ts = _toolset(subtasks=True, store=store)
+        a = await store.add_item(PlanItem(content='A'))
+        b = await store.add_item(PlanItem(content='B'))
+        await ts.set_dependency(_ctx(), b.id, a.id)
+        assert (await store.get_item(b.id)).status is TaskStatus.blocked  # type: ignore[union-attr]
+        # `b` must not show up as available while `a` is unfinished.
+        assert 'B' not in await ts.get_available_tasks(_ctx())
+        # Completing the prerequisite unblocks `b` back to pending.
+        await ts.update_task_status(_ctx(), a.id, TaskStatus.completed)
+        assert (await store.get_item(b.id)).status is TaskStatus.pending  # type: ignore[union-attr]
+        assert 'B' in await ts.get_available_tasks(_ctx())
+
+    async def test_batch_completion_unblocks_dependent(self) -> None:
+        store = InMemoryPlanStore()
+        ts = _toolset(subtasks=True, store=store)
+        a = await store.add_item(PlanItem(content='A'))
+        b = await store.add_item(PlanItem(content='B'))
+        await ts.set_dependency(_ctx(), b.id, a.id)
+        await ts.update_task_statuses(_ctx(), [PlanStatusUpdate(task_id=a.id, status=TaskStatus.completed)])
+        assert (await store.get_item(b.id)).status is TaskStatus.pending  # type: ignore[union-attr]
 
     async def test_get_available_tasks(self) -> None:
         store = InMemoryPlanStore()

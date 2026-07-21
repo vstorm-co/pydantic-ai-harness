@@ -93,6 +93,8 @@ store = InMemoryPlanStore(event_emitter=emitter)
 
 Emitted types: `created`, `updated`, `status_changed`, `completed`, `deleted`.
 
+Events come from the granular tools (`add_task`, `update_task_status`, `add_subtask`, ...). `write_plan` is a bulk whole-plan replacement and is **event-silent**, so a UI driven purely off events won't see plans the model builds or rewrites with `write_plan`. Read the plan after the run too, or steer the model toward the granular tools when you need live event coverage.
+
 ## Why whole-plan replacement
 
 Addressing steps by mutable integer index (insert/remove/reorder) is error-prone for both the code and the model. `write_plan` restates the whole plan each call, so there are no indices to track. Granular edits (`add_task`, `update_task_status`, `remove_task`) instead reference the stable `id` shown by `read_plan`.
