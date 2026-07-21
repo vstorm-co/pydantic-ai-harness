@@ -528,6 +528,7 @@ class PlanningToolset(FunctionToolset[AgentDepsT]):
         new_depends_on = [*item.depends_on, depends_on_id]
         if dependency.status is not TaskStatus.completed and item.status not in (
             TaskStatus.completed,
+            TaskStatus.cancelled,
             TaskStatus.blocked,
         ):
             await store.update_item(task_id, depends_on=new_depends_on, status=TaskStatus.blocked)
