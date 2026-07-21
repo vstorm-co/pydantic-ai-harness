@@ -42,6 +42,7 @@ from pydantic_ai_harness.planning._toolset import (
     render_tree,
     status_counts_line,
     status_icon,
+    validate_hierarchy,
 )
 
 pytestmark = pytest.mark.anyio
@@ -163,6 +164,17 @@ class TestRenderers:
         assert '  2. [ ] [c] Child' in result
         assert '     depends on: x' in result
 
+    def test_render_tree_survives_duplicate_ids(self) -> None:
+        # Two items sharing an id would recurse forever without the visited guard.
+        result = render_tree(
+            [
+                PlanItem(id='p', content='First'),
+                PlanItem(id='p', content='Second', parent_id='p'),
+            ]
+        )
+        assert '1. [ ] [p] First' in result
+        assert 'Second' not in result
+
     def test_status_counts_line_blocked_and_cancelled(self) -> None:
         items = [
             PlanItem(content='a', status=TaskStatus.blocked),
@@ -219,6 +231,17 @@ class TestGraphHelpers:
         missing_dep = PlanItem(content='T', depends_on=['ghost'])
         assert is_blocked([missing_dep], missing_dep) is False
 
+    def test_validate_hierarchy(self) -> None:
+        assert validate_hierarchy([PlanItem(id='a', content='A'), PlanItem(id='b', content='B', parent_id='a')]) is None
+        dup = validate_hierarchy([PlanItem(id='x', content='A'), PlanItem(id='x', content='B')])
+        assert dup is not None and 'Duplicate step ids' in dup
+        dangling = validate_hierarchy([PlanItem(id='a', content='A', parent_id='ghost')])
+        assert dangling is not None and 'not in the plan' in dangling
+        cycle = validate_hierarchy(
+            [PlanItem(id='a', content='A', parent_id='b'), PlanItem(id='b', content='B', parent_id='a')]
+        )
+        assert cycle is not None and 'parent cycle' in cycle
+
 
 # --- Toolset: base tools ----------------------------------------------------
 
@@ -255,6 +278,13 @@ class TestWritePlan:
         await ts.write_plan(_ctx(), [PlanItem(id='x', content='P'), PlanItem(content='C', parent_id='x')])
         stored = (await store.get_items())[1]
         assert stored.parent_id == 'x'
+
+    async def test_subtasks_rejects_bad_hierarchy(self) -> None:
+        store = InMemoryPlanStore()
+        ts = _toolset(subtasks=True, store=store)
+        result = await ts.write_plan(_ctx(), [PlanItem(id='x', content='A'), PlanItem(id='x', content='B')])
+        assert result.startswith('Plan not updated:') and 'Duplicate step ids' in result
+        assert await store.get_items() == []
 
 
 class TestReadPlan:
@@ -307,6 +337,8 @@ class TestUpdateTaskStatus:
         ts = _toolset(subtasks=True, store=store)
         item = await store.add_item(PlanItem(content='A'))
         assert "status to 'blocked'" in await ts.update_task_status(_ctx(), item.id, TaskStatus.blocked)
+        # A manual block on a dependency-free step must persist, not auto-revert.
+        assert (await store.get_item(item.id)).status is TaskStatus.blocked  # type: ignore[union-attr]
 
     async def test_cannot_start_blocked_by_dependency(self) -> None:
         store = InMemoryPlanStore()
@@ -361,6 +393,21 @@ class TestUpdateTaskStatuses:
         a = await store.add_item(PlanItem(content='A'))
         result = await ts.update_task_statuses(_ctx(), [PlanStatusUpdate(task_id=a.id, status=TaskStatus.blocked)])
         assert 'subtasks are not enabled' in result
+
+    async def test_atomic_handoff_completes_prereq_and_starts_dependent(self) -> None:
+        store = InMemoryPlanStore()
+        ts = _toolset(subtasks=True, store=store)
+        a = await store.add_item(PlanItem(content='A'))
+        b = await store.add_item(PlanItem(content='B', depends_on=[a.id], status=TaskStatus.blocked))
+        result = await ts.update_task_statuses(
+            _ctx(),
+            [
+                PlanStatusUpdate(task_id=a.id, status=TaskStatus.completed),
+                PlanStatusUpdate(task_id=b.id, status=TaskStatus.in_progress),
+            ],
+        )
+        assert 'Updated 2 step(s):' in result
+        assert (await store.get_item(b.id)).status is TaskStatus.in_progress  # type: ignore[union-attr]
 
 
 class TestRemoveTask:

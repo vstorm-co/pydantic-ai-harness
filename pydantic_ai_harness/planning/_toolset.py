@@ -127,6 +127,29 @@ def is_blocked(items: list[PlanItem], item: PlanItem) -> bool:
     return False
 
 
+def validate_hierarchy(items: list[PlanItem]) -> str | None:
+    """Return an error message if the plan has duplicate ids or broken/cyclic parents, else `None`."""
+    ids = [item.id for item in items]
+    duplicates = sorted({id_ for id_ in ids if ids.count(id_) > 1})
+    if duplicates:
+        return f'Duplicate step ids: {", ".join(duplicates)}. Every step needs a unique id.'
+    known = set(ids)
+    for item in items:
+        if item.parent_id is not None and item.parent_id not in known:
+            return f"Step '{item.id}' has parent_id '{item.parent_id}', which is not in the plan."
+    by_id = {item.id: item for item in items}
+    for item in items:
+        seen: set[str] = set()
+        parent_id = item.parent_id
+        while parent_id is not None:
+            if parent_id in seen:
+                return f"Step '{item.id}' is part of a parent cycle."
+            seen.add(parent_id)
+            parent = by_id.get(parent_id)
+            parent_id = parent.parent_id if parent is not None else None
+    return None
+
+
 def render_flat(items: list[PlanItem], *, subtasks: bool) -> str:
     """Render the detailed numbered list with ids, annotating parents/dependencies."""
     lines = ['Current plan:']
@@ -146,9 +169,13 @@ def render_tree(items: list[PlanItem]) -> str:
         children.setdefault(item.parent_id, []).append(item)
     lines = ['Current plan (hierarchical view):']
     counter = [0]
+    seen: set[str] = set()
 
     def walk(parent_id: str | None, depth: int) -> None:
         for item in children.get(parent_id, []):
+            if item.id in seen:
+                continue
+            seen.add(item.id)
             counter[0] += 1
             indent = '  ' * depth
             lines.append(f'{indent}{counter[0]}. {status_icon(item.status)} [{item.id}] {item.content}')
@@ -265,6 +292,10 @@ class PlanningToolset(FunctionToolset[AgentDepsT]):
         new_items: list[PlanItem] = []
         for item in items:
             new_items.append(item if self._subtasks else item.model_copy(update={'parent_id': None, 'depends_on': []}))
+        if self._subtasks:
+            error = validate_hierarchy(new_items)
+            if error is not None:
+                return f'Plan not updated: {error}'
         await store.set_items(new_items)
         in_progress = sum(1 for item in new_items if item.status is TaskStatus.in_progress)
         note = '' if in_progress <= 1 else _MULTI_IN_PROGRESS_NOTE
@@ -302,15 +333,14 @@ class PlanningToolset(FunctionToolset[AgentDepsT]):
         return f"Added step '{content}' with id: {item.id}"
 
     async def _unblock_dependents(self, store: PlanStore) -> None:
-        """Clear `blocked` from any step whose dependencies are now all completed.
+        """Return steps auto-blocked by `set_dependency` to `pending` once their prerequisites complete.
 
-        Called after a status change so a step auto-blocked by `set_dependency`
-        returns to `pending` once its prerequisites complete, matching the
-        documented behaviour ("blocked until its prerequisite completes").
+        Only steps with a `depends_on` are touched, so a step manually set to
+        `blocked` is left as-is rather than silently reverted.
         """
         items = await store.get_items()
         for item in items:
-            if item.status is TaskStatus.blocked and not is_blocked(items, item):
+            if item.status is TaskStatus.blocked and item.depends_on and not is_blocked(items, item):
                 await store.update_item(item.id, status=TaskStatus.pending)
 
     async def update_task_status(self, ctx: RunContext[AgentDepsT], task_id: str, status: TaskStatus) -> str:
@@ -345,20 +375,23 @@ class PlanningToolset(FunctionToolset[AgentDepsT]):
         store = self._resolve(ctx)
         if not updates:
             return 'No updates provided.'
-        items = await store.get_items()
+        # Validate against a projection so earlier entries are visible to later ones
+        # (e.g. completing a prerequisite and starting its dependent in one call).
+        projected = [item.model_copy(deep=True) for item in await store.get_items()]
         errors: list[str] = []
         resolved: list[tuple[PlanItem, TaskStatus]] = []
         for update in updates:
             if not self._valid_status(update.status):
                 errors.append(f"Invalid status 'blocked' for '{update.task_id}': subtasks are not enabled.")
                 continue
-            item = find_item(items, update.task_id)
+            item = find_item(projected, update.task_id)
             if item is None:
                 errors.append(f"Step with id '{update.task_id}' not found.")
                 continue
-            if self._subtasks and update.status is TaskStatus.in_progress and is_blocked(items, item):
+            if self._subtasks and update.status is TaskStatus.in_progress and is_blocked(projected, item):
                 errors.append(f"Cannot start '{item.content}': it has incomplete dependencies.")
                 continue
+            item.status = update.status
             resolved.append((item, update.status))
         if errors:
             return 'No changes applied. Errors:\n' + '\n'.join(f'- {error}' for error in errors)
