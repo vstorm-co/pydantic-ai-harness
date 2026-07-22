@@ -142,6 +142,11 @@ class Product(BaseModel):
 BrowserUse(output_schema=Product)
 ```
 
+A schema does not hide a run the sub-agent gave up on: browser-use parses the
+final result whether or not the agent reported success, so when it reports
+failure the tool returns the JSON labelled as an incomplete result rather than
+as a clean answer.
+
 ## Secrets
 
 `sensitive_data` lets the sub-agent type credentials without its model ever
@@ -162,8 +167,10 @@ BrowserUse(
 ## Sessions and safety
 
 - **One session per call** by default; it is killed in a `finally`, so an
-  exception or a cancelled run does not leak a browser process. See
-  [Session reuse](#session-reuse) for the shared alternative.
+  exception or a cancelled run does not leak a browser process. Concurrent
+  calls therefore each drive their own browser, so N calls in flight means N
+  Chromium processes and their memory. See [Session reuse](#session-reuse) for
+  the shared alternative, which serializes calls on one browser.
 - **Domain allowlist.** `allowed_domains` is enforced by browser-use's
   `BrowserProfile`: navigation outside the list is blocked inside the
   sub-agent, not just discouraged in the prompt. Glob patterns like
@@ -183,6 +190,9 @@ BrowserUse(
   "prefer the English version of pages").
 - **Remote browsers.** `cdp_url` attaches the session to an existing Chromium
   (a container, a hosted browser service) instead of launching one locally.
+  Ending a call disconnects from an attached browser rather than terminating
+  it -- browser-use only kills a browser process it launched itself -- so a
+  browser you manage survives `'call'` scope.
 - **Telemetry.** browser-use collects anonymized telemetry by default; set
   `ANONYMIZED_TELEMETRY=false` to disable it.
 
@@ -195,7 +205,8 @@ BrowserUse(
 - `'agent'`: one session is kept alive and reused across calls -- tabs,
   logins, and page state carry over, and calls are serialized on the shared
   browser. Close it with `aclose()`, or use the capability as an async context
-  manager:
+  manager. Closing is final: a `browse_web` after `aclose()` raises rather than
+  starting a browser that nothing is left to close.
 
 ```python
 from pydantic_ai import Agent

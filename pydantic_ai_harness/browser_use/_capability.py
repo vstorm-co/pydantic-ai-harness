@@ -158,11 +158,13 @@ class BrowserUse(AbstractCapability[AgentDepsT]):
     """How long a browser session lives.
 
     `'call'` (the default) gives every `browse_web` call a fresh session and
-    kills it when the call ends. `'agent'` keeps one session alive across
-    calls -- tabs, logins, and page state carry over, and calls are serialized
-    on the shared browser -- until `aclose()` is called (or the capability is
-    used as an async context manager). For cookie/login persistence alone,
-    a `browser_profile` with a `user_data_dir` also works in `'call'` scope.
+    kills it when the call ends, so concurrent calls run in parallel -- one
+    browser process each, with the memory that implies. `'agent'` keeps one
+    session alive across calls -- tabs, logins, and page state carry over, and
+    calls are serialized on the shared browser -- until `aclose()` is called
+    (or the capability is used as an async context manager); after that the
+    capability is closed for good. For cookie/login persistence alone, a
+    `browser_profile` with a `user_data_dir` also works in `'call'` scope.
     """
 
     cdp_url: str | None = None
@@ -170,7 +172,9 @@ class BrowserUse(AbstractCapability[AgentDepsT]):
 
     Points the session at a remote browser, e.g. a container or a hosted
     browser service. When set, it overrides the `browser_profile`'s own
-    `cdp_url`.
+    `cdp_url`. Ending a call disconnects from an attached browser rather than
+    terminating it: browser-use only kills a browser process it launched
+    itself, so a browser you manage survives `'call'` scope.
     """
 
     guidance: str | None = None
@@ -228,10 +232,12 @@ class BrowserUse(AbstractCapability[AgentDepsT]):
         """Kill the shared browser session, if one is alive (`'agent'` scope).
 
         Call it when the capability is no longer needed, or use the capability
-        as an async context manager. A no-op in `'call'` scope and before the
-        first `browse_web` call. It waits for an in-flight `browse_web` call to
-        finish rather than closing the browser under it, so cancel the run first
-        if you need to close sooner.
+        as an async context manager. In `'agent'` scope it closes for good: a
+        later `browse_web` raises rather than starting a browser that nothing
+        would close. A no-op in `'call'` scope, where no session is retained
+        between calls, and before the first `browse_web` call. It waits for an
+        in-flight `browse_web` call to finish rather than closing the browser
+        under it, so cancel the run first if you need to close sooner.
         """
         if self._toolset is not None:
             await self._toolset.aclose()

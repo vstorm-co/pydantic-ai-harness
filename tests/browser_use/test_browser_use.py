@@ -325,7 +325,25 @@ class TestBrowserUseToolset:
 
         result = await BrowserUse[None](browser_agent=factory).get_toolset().browse_web('task')
 
-        assert result == ('The browser agent could not fully complete the task. Its final message: I could not log in.')
+        assert result == ('The browser agent could not fully complete the task. Its final result: I could not log in.')
+
+    async def test_unsuccessful_structured_result_is_flagged(self, kill_calls: list[BrowserSession]) -> None:
+        """A schema parses regardless of the agent's verdict, so the verdict has to survive it.
+
+        browser-use's `structured_output` validates the final result whether or not the
+        sub-agent called `done` with `success=False`, so returning the JSON alone would
+        present a run it gave up on as a clean answer.
+        """
+        facts = _Facts(name='Pro', price_usd=0)
+        history = _FakeHistory(result='{"name": "Pro", "price_usd": 0}', success=False, structured=facts)
+        factory = _FakeFactory(_FakeBrowserAgent(history))
+        capability = BrowserUse[None](output_schema=_Facts, browser_agent=factory)
+
+        result = await capability.get_toolset().browse_web('task')
+
+        assert result == (
+            'The browser agent could not fully complete the task. Its final result: {"name":"Pro","price_usd":0}'
+        )
 
     async def test_structured_output_returned_as_json(self, kill_calls: list[BrowserSession]) -> None:
         facts = _Facts(name='Pro', price_usd=20)
@@ -520,6 +538,67 @@ class TestSessionScope:
         capability = BrowserUse[None](session_scope='agent')
         await capability.aclose()
         assert kill_calls == []
+
+    async def test_browse_web_after_aclose_does_not_reopen(self, kill_calls: list[BrowserSession]) -> None:
+        """`aclose()` closes the shared session for good, rather than letting the next call reopen it.
+
+        A reopened session is created with `keep_alive`, and the `aclose()` that would
+        have closed it has already returned, so it would outlive the run.
+        """
+        factory = _success_factory()
+        capability = BrowserUse[None](session_scope='agent', browser_agent=factory)
+        toolset = capability.get_toolset()
+
+        await toolset.browse_web('first task')
+        await capability.aclose()
+
+        with pytest.raises(RuntimeError, match='closed'):
+            await toolset.browse_web('second task')
+
+        assert len(factory.requests) == 1
+        assert kill_calls == [factory.requests[0].browser_session]
+
+    async def test_call_queued_behind_aclose_does_not_reopen(self, kill_calls: list[BrowserSession]) -> None:
+        """The same guard, reached the way it actually happens: `aclose()` and a call race for the lock.
+
+        A `browse_web` that started while a call was in flight waits on the session lock,
+        so it reaches the shared session only after `aclose()` has taken it away.
+        """
+        running = anyio.Event()
+        release = anyio.Event()
+
+        class _BlockingAgent:
+            async def run(self, max_steps: int = 500) -> _FakeHistory:
+                running.set()
+                await release.wait()
+                return _FakeHistory(result='done', success=True)
+
+        requests: list[BrowserTask] = []
+
+        def factory(request: BrowserTask) -> _BlockingAgent:
+            requests.append(request)
+            return _BlockingAgent()
+
+        capability = BrowserUse[None](session_scope='agent', browser_agent=factory)
+        toolset = capability.get_toolset()
+        queued_error: list[RuntimeError] = []
+
+        async def queued_call() -> None:
+            with pytest.raises(RuntimeError, match='closed') as caught:
+                await toolset.browse_web('second task')
+            queued_error.append(caught.value)
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(toolset.browse_web, 'first task')
+            await running.wait()
+            # Both queue on the session lock the in-flight call holds, `aclose` first.
+            task_group.start_soon(capability.aclose)
+            task_group.start_soon(queued_call)
+            release.set()
+
+        assert len(queued_error) == 1
+        assert len(requests) == 1
+        assert kill_calls == [requests[0].browser_session]
 
     def test_toolset_is_cached(self) -> None:
         capability = BrowserUse[None]()

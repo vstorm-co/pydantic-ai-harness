@@ -257,6 +257,7 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
         self._session_scope: Literal['call', 'agent'] = session_scope
         self._cdp_url = cdp_url
         self._shared_session: BrowserSession | None = None
+        self._session_closed = False
         self._session_lock = asyncio.Lock()
         self.add_function(self.browse_web, name=_TOOL_NAME)
 
@@ -310,22 +311,29 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
             step_errors = [error for error in history.errors() if error]
             detail = '; '.join(step_errors) if step_errors else 'no further details'
             return f'The browser agent stopped without producing a result ({detail}).'
-        if self._output_schema is not None:
-            try:
-                structured = history.structured_output
-            except ValidationError as error:
-                raise ModelRetry(
-                    f'The browser agent finished, but its result did not match the configured output schema: {error}'
-                ) from error
-            if structured is not None:
-                return structured.model_dump_json()
-            # Unreachable with browser-use's own history, which parses whenever
-            # there is a final result and a schema -- both already true here.
-            # Only a custom factory's history can land here, and prose is a
-            # better answer for it than an invented failure.
+        answer = self._render_answer(result, history)
+        # The verdict is applied to whatever the answer turned out to be, schema JSON included:
+        # `structured_output` parses the final result whether or not the sub-agent called `done`
+        # with `success=False`, so reading it alone would present a run it gave up on as a clean
+        # answer.
         if history.is_successful() is False:
-            return f'The browser agent could not fully complete the task. Its final message: {result}'
-        return result
+            return f'The browser agent could not fully complete the task. Its final result: {answer}'
+        return answer
+
+    def _render_answer(self, result: str, history: BrowserAgentHistory) -> str:
+        """The answer itself: schema JSON when one is configured, otherwise the agent's own text."""
+        if self._output_schema is None:
+            return result
+        try:
+            structured = history.structured_output
+        except ValidationError as error:
+            raise ModelRetry(
+                f'The browser agent finished, but its result did not match the configured output schema: {error}'
+            ) from error
+        # A `None` here is unreachable with browser-use's own history, which parses whenever there
+        # is a final result and a schema -- both already true. Only a custom factory's history can
+        # land here, and its prose is a better answer than an invented failure.
+        return structured.model_dump_json() if structured is not None else result
 
     async def browse_web(self, task: str) -> str:
         """Have an autonomous browser agent carry out a web task and return its result.
@@ -355,6 +363,14 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
     async def _run_in_shared_session(self, task: str) -> BrowserAgentHistory:
         """The `'agent'`-scoped shared session; the lock serializes calls -- one browser, one driver at a time."""
         async with self._session_lock:
+            if self._session_closed:
+                # A call that was queued behind `aclose()` reaches the lock after the browser
+                # is gone. Without this it would lazily start a fresh `keep_alive` session that
+                # nothing is left to close, so the process would exit with a live Chromium.
+                raise RuntimeError(
+                    'The shared browser session is closed: `aclose()` was called, so `browse_web` '
+                    'cannot open another one. Build a new capability to browse again.'
+                )
             if self._shared_session is None:
                 self._shared_session = self._build_session()
             try:
@@ -369,16 +385,21 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
                 raise
 
     async def aclose(self) -> None:
-        """Kill the shared browser session, if one is alive.
+        """Kill the shared browser session and refuse to open another.
 
-        Only relevant in `'agent'` session scope; a no-op otherwise. Safe to
-        call multiple times. It takes the same lock as `browse_web`, so it waits
-        for an in-flight call to finish rather than closing the browser under
-        it -- and that call can run for `max_steps` steps of up to
-        `BrowserAgentSettings.step_timeout` each. Cancel the run first if you
-        need to close sooner.
+        Only relevant in `'agent'` session scope: it closes for good, so a later
+        `browse_web` raises rather than starting a browser nothing would close.
+        In `'call'` scope no session is retained between calls, so there is
+        nothing to close and later calls keep working. Safe to call multiple
+        times.
+
+        It takes the same lock as `browse_web`, so it waits for an in-flight
+        call to finish rather than closing the browser under it -- and that call
+        can run for `max_steps` steps of up to `BrowserAgentSettings.step_timeout`
+        each. Cancel the run first if you need to close sooner.
         """
         async with self._session_lock:
+            self._session_closed = True
             if self._shared_session is not None:
                 session, self._shared_session = self._shared_session, None
                 await _kill(session)

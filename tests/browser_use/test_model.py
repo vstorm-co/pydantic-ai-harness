@@ -35,6 +35,10 @@ class _Facts(BaseModel):
     x: int
 
 
+class _Other(BaseModel):
+    y: str
+
+
 _PNG = base64.b64encode(b'not-a-real-png').decode()
 
 
@@ -137,16 +141,17 @@ class TestPydanticAIChatModel:
         result = await model.ainvoke([UserMessage(content='hello')], output_format=_Facts)
         assert isinstance(result.completion, _Facts)
 
-    async def test_structured_agent_is_built_once_per_output_type(self) -> None:
-        """The sub-agent asks for the same output type on every step, so its agent is built once."""
+    async def test_output_type_varies_per_call(self) -> None:
+        """The output type is per call, so alternating between shapes keeps working on one model."""
         model = PydanticAIChatModel(TestModel())
 
-        first = await model.ainvoke([UserMessage(content='hello')], output_format=_Facts)
-        second = await model.ainvoke([UserMessage(content='hello')], output_format=_Facts)
+        facts = await model.ainvoke([UserMessage(content='hello')], output_format=_Facts)
+        text = await model.ainvoke([UserMessage(content='hello')])
+        other = await model.ainvoke([UserMessage(content='hello')], output_format=_Other)
 
-        assert isinstance(first.completion, _Facts)
-        assert isinstance(second.completion, _Facts)
-        assert list(model._typed_agents) == [_Facts]  # pyright: ignore[reportPrivateUsage]
+        assert isinstance(facts.completion, _Facts)
+        assert isinstance(text.completion, str)
+        assert isinstance(other.completion, _Other)
 
     def test_identity_properties(self) -> None:
         model = PydanticAIChatModel('test')

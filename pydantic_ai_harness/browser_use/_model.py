@@ -10,7 +10,7 @@ is active.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TypeAlias, TypeVar, cast, overload
+from typing import TypeAlias, TypeVar, overload
 
 from pydantic import BaseModel
 from pydantic_ai import Agent
@@ -138,33 +138,22 @@ class PydanticAIChatModel(BaseChatModel):
     """Implements browser-use's `BaseChatModel` protocol on top of a Pydantic AI model.
 
     Each `ainvoke` maps the browser-use conversation onto Pydantic AI messages
-    and runs one model turn through an internal `Agent`. Structured output uses
-    Pydantic AI's output handling (tool calling by default, with validation
-    retries), which works uniformly across providers -- including ones that
-    reject browser-use's `response_format` JSON schema.
+    and runs one model turn through an internal `Agent`, passing the step's
+    output type per call. Structured output uses Pydantic AI's output handling
+    (tool calling by default, with validation retries), which works uniformly
+    across providers -- including ones that reject browser-use's
+    `response_format` JSON schema.
     """
 
+    # browser-use verifies provider API keys before the first step by reading its own
+    # environment variables; a Pydantic AI model already carries its provider configuration,
+    # so declare the keys verified and let the model raise if it is misconfigured.
     _verified_api_keys: bool = True
 
     def __init__(self, model: Model | KnownModelName | str) -> None:
         self._model = infer_model(model)
         self.model: str = self._model.model_name
-        self._text_agent = Agent(self._model)
-        # The sub-agent calls `ainvoke` once per step with the same handful of
-        # output types, and building an agent for a typed output builds its
-        # output schema; cache per type instead of rebuilding on every step.
-        # Heterogeneous by nature -- each entry's output type is its own key.
-        self._typed_agents: dict[type[BaseModel], object] = {}
-
-    def _agent_for(self, output_format: type[T]) -> Agent[None, T]:
-        """The structured-output agent for `output_format`, built once and reused."""
-        cached = self._typed_agents.get(output_format)
-        if cached is not None:
-            # Keyed by the very type the agent was built for, so this holds.
-            return cast('Agent[None, T]', cached)
-        agent = Agent(self._model, output_type=output_format)
-        self._typed_agents[output_format] = agent
-        return agent
+        self._agent = Agent(self._model)
 
     @property
     def provider(self) -> str:
@@ -192,9 +181,9 @@ class PydanticAIChatModel(BaseChatModel):
         """Run one model turn over the mapped conversation, optionally with structured output."""
         history = _map_messages(messages)
         if output_format is None:
-            text_result = await self._text_agent.run(None, message_history=history)
+            text_result = await self._agent.run(None, message_history=history)
             return ChatInvokeCompletion(completion=text_result.output, usage=_map_usage(text_result.usage))
-        result = await self._agent_for(output_format).run(None, message_history=history)
+        result = await self._agent.run(None, output_type=output_format, message_history=history)
         return ChatInvokeCompletion(completion=result.output, usage=_map_usage(result.usage))
 
 
