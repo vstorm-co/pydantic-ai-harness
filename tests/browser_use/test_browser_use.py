@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import inspect
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import TypeVar, overload
 
+import anyio
 import pytest
 
 # `browser_use.Agent` is imported from its defining module: the test package
@@ -29,6 +31,7 @@ from pydantic_ai_harness.browser_use import (
     BrowserUse,
     BrowserUseToolset,
     PydanticAIChatModel,
+    default_browser_agent,
 )
 
 T = TypeVar('T', bound=BaseModel)
@@ -255,6 +258,50 @@ class TestBrowserUseToolset:
         [killed] = kill_calls
         assert killed is factory.requests[0].browser_session
 
+    @pytest.mark.parametrize('session_scope', ['call', 'agent'])
+    async def test_session_killed_when_the_call_is_cancelled(
+        self, monkeypatch: pytest.MonkeyPatch, session_scope: str
+    ) -> None:
+        """A cancelled `browse_web` still closes the browser.
+
+        The real `kill` suspends several times over CDP, so the fake suspends
+        too: without the shield around teardown, the first of those checkpoints
+        raises inside the cancelled scope and the browser is never closed.
+        """
+        killed: list[BrowserSession] = []
+
+        async def suspending_kill(self: BrowserSession) -> None:
+            await anyio.sleep(0)
+            killed.append(self)
+
+        monkeypatch.setattr(BrowserSession, 'kill', suspending_kill)
+
+        running = anyio.Event()
+
+        class _HangingAgent:
+            async def run(self, max_steps: int = 500) -> _FakeHistory:
+                running.set()
+                await anyio.sleep_forever()
+                raise AssertionError('unreachable')  # pragma: no cover
+
+        requests: list[BrowserTask] = []
+
+        def factory(request: BrowserTask) -> _HangingAgent:
+            requests.append(request)
+            return _HangingAgent()
+
+        toolset = BrowserUse[None](
+            session_scope='agent' if session_scope == 'agent' else 'call',
+            browser_agent=factory,
+        ).get_toolset()
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(toolset.browse_web, 'task')
+            await running.wait()
+            task_group.cancel_scope.cancel()
+
+        assert killed == [requests[0].browser_session]
+
     async def test_no_result_reports_step_errors(self, kill_calls: list[BrowserSession]) -> None:
         history = _FakeHistory(step_errors=[None, 'timeout on step 2', 'element not found'])
         factory = _FakeFactory(_FakeBrowserAgent(history))
@@ -364,6 +411,50 @@ class TestBrowserUseToolset:
         await capability.get_toolset().browse_web('task')
 
         assert isinstance(factory.requests[0].settings.judge_llm, PydanticAIChatModel)
+
+
+class TestBrowserAgentSettings:
+    def test_mirrors_browser_use_defaults(self) -> None:
+        """Every setting is a real `browser_use.Agent` option at browser-use's own default.
+
+        The promise of `BrowserAgentSettings` is that an empty instance changes
+        nothing, so a browser-use upgrade that renames an option or moves a
+        default has to fail here rather than quietly alter how the sub-agent
+        behaves.
+        """
+        # browser-use's own constructor is partially untyped (`**kwargs`, a bare
+        # `dict` schema), so pyright cannot see it as fully known.
+        parameters = inspect.signature(
+            BrowserUseAgent.__init__  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
+        ).parameters
+        for setting in fields(BrowserAgentSettings):
+            parameter = parameters.get(setting.name)
+            assert parameter is not None, f'{setting.name} is not a browser_use.Agent option'
+            assert parameter.default == setting.default, f'{setting.name} default drifted from browser-use'
+
+    def test_every_setting_reaches_the_agent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The default factory forwards each setting; a forgotten one would silently do nothing."""
+        seen: dict[str, object] = {}
+
+        def record_init(self: object, **kwargs: object) -> None:
+            seen.update(kwargs)
+
+        monkeypatch.setattr(BrowserUseAgent, '__init__', record_init)
+        default_browser_agent(
+            BrowserTask(
+                task='task',
+                llm=None,
+                browser_session=BrowserSession(),
+                use_vision=True,
+                output_schema=None,
+                sensitive_data=None,
+                extend_system_message=None,
+                settings=BrowserAgentSettings(),
+            )
+        )
+
+        missing = [setting.name for setting in fields(BrowserAgentSettings) if setting.name not in seen]
+        assert missing == []
 
 
 class TestSessionScope:

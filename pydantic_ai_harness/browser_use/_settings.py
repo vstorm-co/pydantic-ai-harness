@@ -1,11 +1,15 @@
 """Typed passthrough for the browser-use `Agent` constructor options.
 
-`BrowserAgentSettings` mirrors the user-facing options of `browser_use.Agent`
-(v0.13.x) with browser-use's own defaults, so the whole surface is configurable
-on the capability without writing a custom factory. Options the capability
-already owns as first-class fields (task, llm, session, vision, output schema,
-sensitive data, system-message extension, signal handling) are deliberately not
-repeated here.
+`BrowserAgentSettings` mirrors the plain-value options of `browser_use.Agent`
+(v0.13.x) with browser-use's own defaults, so the whole configurable surface is
+reachable from the capability without writing a custom factory. Three groups are
+deliberately absent: options the capability already owns as first-class fields
+(task, llm, session, vision, output schema, sensitive data, system-message
+extension, signal handling), options that are objects the caller has to build in
+code (browser-use's callbacks, `injected_agent_state`, `skill_service` -- these
+belong in a `BrowserAgentFactory`), and options the toolset controls or that are
+not user-facing (`browser`, `browser_profile`, the deprecated `controller` alias
+of `tools`, per-run identity like `task_id` and `source`, and private ones).
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ from typing import TYPE_CHECKING, Literal
 try:
     from browser_use import Tools
     from browser_use.agent.views import MessageCompactionSettings
+    from browser_use.llm.messages import ContentPartImageParam, ContentPartTextParam
 except ImportError as _import_error:  # pragma: no cover
     raise ImportError(
         'browser-use is required for BrowserUse. Install it with: pip install "pydantic-ai-harness[browser-use]"'
@@ -28,13 +33,15 @@ if TYPE_CHECKING:
 
 @dataclass
 class BrowserAgentSettings:
-    """Every remaining `browser_use.Agent` option, with browser-use's defaults.
+    """Every remaining plain-value `browser_use.Agent` option, with browser-use's defaults.
 
     Pass an instance as `BrowserUse.agent_settings`. The defaults are a
     snapshot of browser-use's own (the pinned minimum version), so an empty
-    instance behaves exactly like not passing one. The `*_llm` fields accept
-    the same inputs as the capability's `llm` field: a browser-use chat model,
-    a Pydantic AI model, or a model name string.
+    instance behaves exactly like not passing one; a test asserts that mirror
+    field by field, so an upgrade that moves a default is caught rather than
+    silently changing behaviour. The `*_llm` fields accept the same inputs as
+    the capability's `llm` field: a browser-use chat model, a Pydantic AI model,
+    or a model name string.
     """
 
     tools: Tools[None] | None = None
@@ -127,8 +134,35 @@ class BrowserAgentSettings:
     available_file_paths: list[str] | None = None
     """Files the agent may reference or upload."""
 
+    file_system_path: str | None = None
+    """Directory backing the sub-agent's own file system; `None` uses a temporary one per run."""
+
+    display_files_in_done_text: bool = True
+    """Include the contents of files the agent wrote in its final message."""
+
     save_conversation_path: str | Path | None = None
     """Write the full sub-agent conversation to this path for debugging."""
+
+    save_conversation_path_encoding: str | None = 'utf-8'
+    """Encoding for the saved conversation file."""
+
+    include_attributes: list[str] | None = None
+    """DOM attributes serialized for the model with each element; `None` uses browser-use's set."""
+
+    extraction_schema: dict[str, object] | None = None
+    """JSON schema for browser-use's page-extraction action (distinct from the task's `output_schema`)."""
+
+    sample_images: list[ContentPartTextParam | ContentPartImageParam] | None = None
+    """Reference images (with captions) prepended to the sub-agent's context, e.g. what to look for."""
+
+    skills: list[str | Literal['*']] | None = None
+    """browser-use skills to enable by name, or `'*'` for all; needs a browser-use account."""
+
+    skill_ids: list[str | Literal['*']] | None = None
+    """browser-use skills to enable by id; the id-addressed counterpart of `skills`."""
+
+    pricing_url: str | None = None
+    """Override the pricing data source used when `calculate_cost` is on."""
 
     generate_gif: bool | str = False
     """Record the run as a GIF (`True` for a default path, or a target path)."""

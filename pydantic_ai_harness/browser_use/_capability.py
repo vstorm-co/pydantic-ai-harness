@@ -229,7 +229,9 @@ class BrowserUse(AbstractCapability[AgentDepsT]):
 
         Call it when the capability is no longer needed, or use the capability
         as an async context manager. A no-op in `'call'` scope and before the
-        first `browse_web` call.
+        first `browse_web` call. It waits for an in-flight `browse_web` call to
+        finish rather than closing the browser under it, so cancel the run first
+        if you need to close sooner.
         """
         if self._toolset is not None:
             await self._toolset.aclose()

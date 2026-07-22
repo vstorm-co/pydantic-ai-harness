@@ -240,7 +240,7 @@ BrowserUse(
     output_schema=None,          # Pydantic model class for a structured, validated result
     sensitive_data=None,         # secrets typed by the browser, never shown to the model
     extend_system_message=None,  # extra standing instructions for the sub-agent
-    agent_settings=None,         # BrowserAgentSettings: every remaining browser_use.Agent option
+    agent_settings=None,         # BrowserAgentSettings: every remaining plain-value Agent option
     session_scope='call',        # 'call' = fresh browser per call; 'agent' = one shared session
     cdp_url=None,                # attach to a remote Chromium over CDP; overrides the profile
     guidance=None,               # host-model instructions: None = default, '' = none, str = custom
@@ -250,10 +250,11 @@ BrowserUse(
 
 ## Custom agent factory
 
-For the corners neither the fields nor `agent_settings` cover (browser-use
-callbacks, skills, injected agent state) -- or to substitute a fake in tests so
-nothing launches a browser -- the `browser_agent` field accepts a
-`BrowserAgentFactory`. It receives a `BrowserTask` with everything the tool
+`agent_settings` covers browser-use's plain-value options; the ones you have to
+build in code (callbacks, injected agent state, a custom skill service) go
+through the factory instead. Pass a `BrowserAgentFactory` as `browser_agent` for
+those, or to substitute a fake in tests so nothing launches a browser. It
+receives a `BrowserTask` with everything the tool
 prepared for the call, including the resolved `settings`, and returns the
 agent to run:
 

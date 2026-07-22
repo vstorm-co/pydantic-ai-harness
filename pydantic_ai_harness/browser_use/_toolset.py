@@ -7,6 +7,7 @@ from collections.abc import Awaitable
 from dataclasses import dataclass, replace
 from typing import Literal, Protocol
 
+import anyio
 from pydantic import BaseModel, ValidationError
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.tools import AgentDepsT
@@ -25,6 +26,26 @@ except ImportError as _import_error:  # pragma: no cover
     ) from _import_error
 
 _TOOL_NAME = 'browse_web'
+
+# Teardown runs shielded from cancellation, so an unresponsive browser could otherwise hang the
+# caller forever on exit. Bound it instead: a browser that will not close within this window is
+# left to the OS at interpreter exit, which is strictly better than wedging the run.
+_TEARDOWN_TIMEOUT = 30
+
+
+async def _kill(session: BrowserSession) -> None:
+    """Close a browser session, even while the caller is being cancelled.
+
+    `BrowserSession.kill` is not a single round-trip: it saves storage state,
+    dispatches a stop event, and drains the event bus, so it suspends several
+    times over CDP. Unshielded, the first of those awaits inside a cancelled
+    scope raises and leaves a live Chromium behind -- holding a lock on
+    `user_data_dir` if the profile has one. The same shape as `ModalSandbox`'s
+    teardown, for the same reason.
+    """
+    with anyio.CancelScope(shield=True):
+        with anyio.move_on_after(_TEARDOWN_TIMEOUT):
+            await session.kill()
 
 
 class BrowserAgentHistory(Protocol):
@@ -179,7 +200,16 @@ def default_browser_agent(request: BrowserTask) -> BrowserAgent:
         include_tool_call_examples=settings.include_tool_call_examples,
         initial_actions=settings.initial_actions,
         available_file_paths=settings.available_file_paths,
+        file_system_path=settings.file_system_path,
+        display_files_in_done_text=settings.display_files_in_done_text,
         save_conversation_path=settings.save_conversation_path,
+        save_conversation_path_encoding=settings.save_conversation_path_encoding,
+        include_attributes=settings.include_attributes,
+        extraction_schema=settings.extraction_schema,
+        sample_images=settings.sample_images,
+        skills=settings.skills,
+        skill_ids=settings.skill_ids,
+        pricing_url=settings.pricing_url,
         generate_gif=settings.generate_gif,
         demo_mode=settings.demo_mode,
     )
@@ -289,6 +319,10 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
                 ) from error
             if structured is not None:
                 return structured.model_dump_json()
+            # Unreachable with browser-use's own history, which parses whenever
+            # there is a final result and a schema -- both already true here.
+            # Only a custom factory's history can land here, and prose is a
+            # better answer for it than an invented failure.
         if history.is_successful() is False:
             return f'The browser agent could not fully complete the task. Its final message: {result}'
         return result
@@ -316,7 +350,7 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
         try:
             return await self._run_agent(task, session)
         finally:
-            await session.kill()
+            await _kill(session)
 
     async def _run_in_shared_session(self, task: str) -> BrowserAgentHistory:
         """The `'agent'`-scoped shared session; the lock serializes calls -- one browser, one driver at a time."""
@@ -327,18 +361,24 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
                 return await self._run_agent(task, self._shared_session)
             except BaseException:
                 # A failed or cancelled run can leave the shared browser in an
-                # unknown state; kill it so the next call starts fresh.
+                # unknown state; kill it so the next call starts fresh. Dropping
+                # the reference first makes this the last chance to close that
+                # session, which is why the kill has to survive cancellation.
                 session, self._shared_session = self._shared_session, None
-                await session.kill()
+                await _kill(session)
                 raise
 
     async def aclose(self) -> None:
         """Kill the shared browser session, if one is alive.
 
         Only relevant in `'agent'` session scope; a no-op otherwise. Safe to
-        call multiple times.
+        call multiple times. It takes the same lock as `browse_web`, so it waits
+        for an in-flight call to finish rather than closing the browser under
+        it -- and that call can run for `max_steps` steps of up to
+        `BrowserAgentSettings.step_timeout` each. Cancel the run first if you
+        need to close sooner.
         """
         async with self._session_lock:
             if self._shared_session is not None:
                 session, self._shared_session = self._shared_session, None
-                await session.kill()
+                await _kill(session)
