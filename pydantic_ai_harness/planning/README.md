@@ -59,7 +59,7 @@ Pass `enable_subtasks=True` to add three more tools and the `blocked` status:
 | Tool | Purpose |
 |---|---|
 | `add_subtask(parent_id, content, active_form)` | Add a child step under a parent. |
-| `set_dependency(task_id, depends_on_id)` | Make one step wait for another; the dependent step is auto-`blocked` until its prerequisite completes. Self-dependencies, cycles, and duplicates are rejected. |
+| `set_dependency(task_id, depends_on_id)` | Make one step wait for another; the dependent step is auto-`blocked` until its prerequisite is resolved (completed or cancelled). Self-dependencies, cycles, and duplicates are rejected. |
 | `get_available_tasks()` | List steps with no incomplete dependencies -- the ones that can start now. |
 
 ## Persistence

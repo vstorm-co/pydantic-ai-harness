@@ -59,7 +59,14 @@ class PostgresPool(Protocol):
 
 
 class PostgresPlanStore:
-    """PostgreSQL plan storage scoped to a `session` for multi-tenancy."""
+    """PostgreSQL plan storage scoped to a `session` for multi-tenancy.
+
+    `set_items` runs in a transaction and is atomic. The granular ops are not
+    wrapped in a shared transaction -- `add_item` picks its sequence with a
+    non-transactional `MAX(seq) + 1`, and `update_item`/`remove_item` are
+    read-modify-write -- so concurrent writers on the same session can race.
+    Drive one session from one task, or use `set_items` for atomic writes.
+    """
 
     def __init__(
         self,

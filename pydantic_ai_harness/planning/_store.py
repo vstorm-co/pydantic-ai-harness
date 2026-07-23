@@ -189,8 +189,11 @@ class InMemoryPlanStore:
 class SqlitePlanStore:
     """SQLite-backed plan storage, scoped to a `session` for multi-tenancy.
 
-    Blocking `sqlite3` calls run on a worker thread and are serialized by a lock,
-    so the store is safe to share across concurrent tasks within one process.
+    Each blocking `sqlite3` call runs on a worker thread under a lock, so any
+    single operation is safe. The read-modify-write ops (`update_item`,
+    `remove_item`) span two locked calls, though, so concurrent writers on the
+    same session can still race (last-write-wins). Drive one session from one
+    task, or use `set_items` for atomic whole-plan writes.
     """
 
     def __init__(

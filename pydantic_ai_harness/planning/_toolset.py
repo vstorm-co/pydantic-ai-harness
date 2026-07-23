@@ -56,8 +56,8 @@ complete them before completing the parent.\
 
 SET_DEPENDENCY_DESCRIPTION = """\
 Record that one step must wait for another to complete. The dependent step is \
-automatically marked `blocked` until its prerequisite is `completed`. \
-Self-dependencies, cycles, and duplicates are rejected.\
+automatically marked `blocked` until its prerequisite is resolved (`completed` \
+or `cancelled`). Self-dependencies, cycles, and duplicates are rejected.\
 """
 
 GET_AVAILABLE_TASKS_DESCRIPTION = """\
@@ -117,12 +117,21 @@ def has_cycle(items: list[PlanItem], item_id: str, depends_on_id: str) -> bool:
     return visit(depends_on_id)
 
 
+def is_terminal(status: TaskStatus) -> bool:
+    """Return whether `status` is terminal -- a step that will not progress further."""
+    return status in (TaskStatus.completed, TaskStatus.cancelled)
+
+
 def is_blocked(items: list[PlanItem], item: PlanItem) -> bool:
-    """Return whether `item` has any dependency that is not yet completed."""
+    """Return whether `item` has a dependency that is not yet resolved.
+
+    A terminal prerequisite (completed or cancelled) no longer blocks -- a
+    cancelled step will never complete, so it must not hold up its dependents.
+    """
     by_id = {node.id: node for node in items}
     for dep_id in item.depends_on:
         dep = by_id.get(dep_id)
-        if dep is not None and dep.status is not TaskStatus.completed:
+        if dep is not None and not is_terminal(dep.status):
             return True
     return False
 
@@ -526,10 +535,10 @@ class PlanningToolset(FunctionToolset[AgentDepsT]):
         if depends_on_id in item.depends_on:
             return 'Dependency already exists.'
         new_depends_on = [*item.depends_on, depends_on_id]
-        if dependency.status is not TaskStatus.completed and item.status not in (
-            TaskStatus.completed,
-            TaskStatus.cancelled,
-            TaskStatus.blocked,
+        if (
+            not is_terminal(dependency.status)
+            and not is_terminal(item.status)
+            and item.status is not TaskStatus.blocked
         ):
             await store.update_item(task_id, depends_on=new_depends_on, status=TaskStatus.blocked)
             return (

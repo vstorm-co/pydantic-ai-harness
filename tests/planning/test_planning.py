@@ -555,6 +555,19 @@ class TestSubtaskTools:
         assert (await store.get_item(b.id)).status is TaskStatus.pending  # type: ignore[union-attr]
         assert 'B' in await ts.get_available_tasks(_ctx())
 
+    async def test_cancelling_prerequisite_unblocks_dependent(self) -> None:
+        store = InMemoryPlanStore()
+        ts = _toolset(subtasks=True, store=store)
+        a = await store.add_item(PlanItem(content='A'))
+        b = await store.add_item(PlanItem(content='B'))
+        await ts.set_dependency(_ctx(), b.id, a.id)
+        assert (await store.get_item(b.id)).status is TaskStatus.blocked  # type: ignore[union-attr]
+        # A cancelled prerequisite will never complete, so it must free its dependent.
+        await ts.update_task_status(_ctx(), a.id, TaskStatus.cancelled)
+        assert (await store.get_item(b.id)).status is TaskStatus.pending  # type: ignore[union-attr]
+        assert 'B' in await ts.get_available_tasks(_ctx())
+        assert "status to 'in_progress'" in await ts.update_task_status(_ctx(), b.id, TaskStatus.in_progress)
+
     async def test_batch_completion_unblocks_dependent(self) -> None:
         store = InMemoryPlanStore()
         ts = _toolset(subtasks=True, store=store)
