@@ -307,7 +307,8 @@ class TestWritePlan:
         store = InMemoryPlanStore()
         ts = _toolset(subtasks=True, store=store)
         # A pending step with an incomplete prerequisite is reconciled to `blocked`;
-        # a `blocked` step whose prerequisite is already done is reconciled to `pending`.
+        # a `blocked` step whose prerequisite is already done is reconciled to `pending`;
+        # a pending step whose prerequisite is already done is left pending.
         await ts.write_plan(
             _ctx(),
             [
@@ -315,10 +316,28 @@ class TestWritePlan:
                 PlanItem(id='b', content='B', depends_on=['a']),
                 PlanItem(id='c', content='C', status=TaskStatus.completed),
                 PlanItem(id='d', content='D', status=TaskStatus.blocked, depends_on=['c']),
+                PlanItem(id='e', content='E', depends_on=['c']),
             ],
         )
         assert (await store.get_item('b')).status is TaskStatus.blocked  # type: ignore[union-attr]
         assert (await store.get_item('d')).status is TaskStatus.pending  # type: ignore[union-attr]
+        assert (await store.get_item('e')).status is TaskStatus.pending  # type: ignore[union-attr]
+
+    async def test_auto_blocking_stays_event_silent(self) -> None:
+        # write_plan is a bulk replacement: it reconciles dependency blocks before
+        # storing, so it must not emit per-step events even when a step is blocked.
+        events: list[PlanEvent] = []
+        emitter = PlanEventEmitter()
+        for kind in PlanEventType:
+            emitter.on(kind, events.append)
+        store = InMemoryPlanStore(event_emitter=emitter)
+        ts = _toolset(subtasks=True, store=store)
+        await ts.write_plan(
+            _ctx(),
+            [PlanItem(id='a', content='A'), PlanItem(id='b', content='B', depends_on=['a'])],
+        )
+        assert (await store.get_item('b')).status is TaskStatus.blocked  # type: ignore[union-attr]
+        assert events == []
 
     async def test_subtasks_rejects_bad_hierarchy(self) -> None:
         store = InMemoryPlanStore()

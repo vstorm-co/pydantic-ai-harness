@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 from pydantic_ai.tools import AgentDepsT, RunContext
@@ -136,6 +137,25 @@ def is_blocked(items: list[PlanItem], item: PlanItem) -> bool:
         if dep is not None and not is_terminal(dep.status):
             return True
     return False
+
+
+def dependency_block_transitions(items: list[PlanItem]) -> Iterator[tuple[PlanItem, TaskStatus]]:
+    """Yield `(item, new_status)` for each step whose dependency-driven block must change.
+
+    A step with an unresolved prerequisite becomes `blocked`; a `blocked` step
+    whose prerequisites are all resolved returns to `pending`. Steps without
+    dependencies, and terminal steps, are left as they are. Every transition is
+    computed against the same input snapshot, so callers can apply them in any
+    order.
+    """
+    for item in items:
+        if not item.depends_on:
+            continue
+        blocked = is_blocked(items, item)
+        if blocked and item.status in (TaskStatus.pending, TaskStatus.in_progress):
+            yield item, TaskStatus.blocked
+        elif not blocked and item.status is TaskStatus.blocked:
+            yield item, TaskStatus.pending
 
 
 def validate_hierarchy(items: list[PlanItem]) -> str | None:
@@ -327,10 +347,11 @@ class PlanningToolset(FunctionToolset[AgentDepsT]):
             error = validate_hierarchy(new_items)
             if error is not None:
                 return f'Plan not updated: {error}'
+            # Reconcile dependency blocks in memory before storing, so `write_plan`
+            # commits one bulk `set_items` and stays event-silent (no per-step events).
+            for item, new_status in list(dependency_block_transitions(new_items)):
+                item.status = new_status
         await store.set_items(new_items)
-        if self._subtasks:
-            await self._sync_dependency_blocks(store)
-            new_items = await store.get_items()
         in_progress = sum(1 for item in new_items if item.status is TaskStatus.in_progress)
         note = '' if in_progress <= 1 else _MULTI_IN_PROGRESS_NOTE
         return f'Plan updated: {len(new_items)} step(s).\n\n{render_plan(new_items)}{note}'
@@ -371,17 +392,12 @@ class PlanningToolset(FunctionToolset[AgentDepsT]):
 
         A step with dependencies is `blocked` while any prerequisite is incomplete
         and returns to `pending` once they all complete. Steps without dependencies,
-        and completed/cancelled steps, are left untouched.
+        and completed/cancelled steps, are left untouched. Each transition is written
+        through the store, so the granular tools emit `status_changed` events for it.
         """
         items = await store.get_items()
-        for item in items:
-            if not item.depends_on:
-                continue
-            blocked = is_blocked(items, item)
-            if blocked and item.status in (TaskStatus.pending, TaskStatus.in_progress):
-                await store.update_item(item.id, status=TaskStatus.blocked)
-            elif not blocked and item.status is TaskStatus.blocked:
-                await store.update_item(item.id, status=TaskStatus.pending)
+        for item, new_status in list(dependency_block_transitions(items)):
+            await store.update_item(item.id, status=new_status)
 
     async def update_task_status(self, ctx: RunContext[AgentDepsT], task_id: str, status: TaskStatus) -> str:
         """Update one step's status by id.
