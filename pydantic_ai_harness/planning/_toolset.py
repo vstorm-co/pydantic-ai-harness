@@ -40,7 +40,9 @@ or the implementation is partial.\
 UPDATE_TASK_STATUSES_DESCRIPTION = """\
 Update several steps' statuses in one call -- ideal for handing off from a \
 finished step to the next one. The whole batch is validated first: if any entry \
-is invalid nothing is applied and the errors are returned.\
+is invalid nothing is applied and the errors are returned. Entries apply in \
+order, so when a batch both completes a prerequisite and starts its dependent, \
+list the prerequisite's completion first.\
 """
 
 REMOVE_TASK_DESCRIPTION = """\

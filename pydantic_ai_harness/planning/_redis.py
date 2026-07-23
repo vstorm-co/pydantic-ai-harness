@@ -32,13 +32,17 @@ class RedisClient(Protocol):
         """Return the value at `key`, or `None`."""
         ...  # pragma: no cover
 
-    async def set(self, key: str, value: str) -> object:
-        """Set `key` to `value`."""
+    async def set(self, key: str, value: str, *, ex: int | None = None) -> object:
+        """Set `key` to `value`, optionally expiring it after `ex` seconds."""
         ...  # pragma: no cover
 
 
 class RedisPlanStore:
-    """Redis plan storage scoped to a `session` for multi-tenancy."""
+    """Redis plan storage scoped to a `session` for multi-tenancy.
+
+    Pass `expire_seconds` to give the session key a TTL (refreshed on every
+    write), so plans for abandoned sessions expire instead of living forever.
+    """
 
     def __init__(
         self,
@@ -46,11 +50,13 @@ class RedisPlanStore:
         *,
         session: str = 'default',
         key_prefix: str = 'plan',
+        expire_seconds: int | None = None,
         event_emitter: PlanEventEmitter | None = None,
     ) -> None:
         self._client = client
         self._session = session
         self._key_prefix = key_prefix
+        self._expire_seconds = expire_seconds
         self._emitter = event_emitter
 
     @property
@@ -66,7 +72,8 @@ class RedisPlanStore:
         return [PlanItem.model_validate(entry) for entry in json.loads(text)]
 
     async def _save(self, items: list[PlanItem]) -> None:
-        await self._client.set(self._key, json.dumps([item.model_dump(mode='json') for item in items]))
+        payload = json.dumps([item.model_dump(mode='json') for item in items])
+        await self._client.set(self._key, payload, ex=self._expire_seconds)
 
     async def get_items(self) -> list[PlanItem]:
         """Return every step for this session in insertion order."""

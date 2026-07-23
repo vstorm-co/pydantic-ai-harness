@@ -608,6 +608,13 @@ class TestCapability:
         assert Planning[None](guidance='Custom.').get_instructions() == 'Custom.'
         assert Planning[None](guidance='').get_instructions() is None
 
+    def test_get_instructions_subtasks(self) -> None:
+        base = cast(str, Planning[None]().get_instructions())
+        assert 'add_subtask' not in base
+        subtasks = cast(str, Planning[None](enable_subtasks=True).get_instructions())
+        assert 'add_subtask' in subtasks and 'set_dependency' in subtasks and 'get_available_tasks' in subtasks
+        assert Planning[None](guidance='Custom.', enable_subtasks=True).get_instructions() == 'Custom.'
+
     def test_get_toolset_type(self) -> None:
         assert isinstance(Planning[None]().get_toolset(), PlanningToolset)
 

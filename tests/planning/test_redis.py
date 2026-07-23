@@ -32,6 +32,7 @@ class FakeRedis:
     def __init__(self, *, decode: bool = False) -> None:
         self._data: dict[str, str] = {}
         self._decode = decode
+        self.last_ex: int | None = None
 
     async def get(self, key: str) -> object:
         value = self._data.get(key)
@@ -39,8 +40,9 @@ class FakeRedis:
             return None
         return value if self._decode else value.encode()
 
-    async def set(self, key: str, value: str) -> object:
+    async def set(self, key: str, value: str, *, ex: int | None = None) -> object:
         self._data[key] = value
+        self.last_ex = ex
         return True
 
 
@@ -88,6 +90,18 @@ class TestRedisStore:
         assert [i.content for i in await store.get_items()] == ['first']
         assert await store.remove_item(first.id) is True
         assert await store.remove_item('missing') is False
+
+    async def test_expire_seconds_passed_through(self) -> None:
+        client = FakeRedis()
+        store = RedisPlanStore(client, expire_seconds=3600)
+        await store.add_item(_item('A'))
+        assert client.last_ex == 3600
+
+    async def test_no_expire_by_default(self) -> None:
+        client = FakeRedis()
+        store = RedisPlanStore(client)
+        await store.add_item(_item('A'))
+        assert client.last_ex is None
 
     async def test_decode_responses_client(self) -> None:
         # A client configured with decode_responses=True returns str, not bytes.

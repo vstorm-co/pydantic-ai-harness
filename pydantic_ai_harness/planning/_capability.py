@@ -27,6 +27,13 @@ _DEFAULT_GUIDANCE = (
     'between statuses, and `read_plan` to see step ids before a granular edit.'
 )
 
+_SUBTASK_GUIDANCE = (
+    'Break a complex step into subtasks with `add_subtask`, and record ordering with '
+    '`set_dependency`: a step stays `blocked` until every step it depends on is resolved '
+    '(`completed` or `cancelled`). Call `get_available_tasks` to pick the next step that has no '
+    'incomplete dependencies.'
+)
+
 
 @dataclass
 class Planning(AbstractCapability[AgentDepsT]):
@@ -101,9 +108,17 @@ class Planning(AbstractCapability[AgentDepsT]):
         return PlanningToolset[AgentDepsT](self)
 
     def get_instructions(self) -> AgentInstructions[AgentDepsT] | None:
-        """Provide static, cache-stable guidance on using the planning tools."""
-        guidance = _DEFAULT_GUIDANCE if self.guidance is None else self.guidance
-        return guidance or None
+        """Provide static, cache-stable guidance on using the planning tools.
+
+        A custom `guidance` string is used verbatim; the default is extended with
+        the subtask/dependency workflow when `enable_subtasks` is set, so the
+        model is told about the tools it actually has.
+        """
+        if self.guidance is not None:
+            return self.guidance or None
+        if self.enable_subtasks:
+            return f'{_DEFAULT_GUIDANCE} {_SUBTASK_GUIDANCE}'
+        return _DEFAULT_GUIDANCE
 
     async def wrap_model_request(
         self,
