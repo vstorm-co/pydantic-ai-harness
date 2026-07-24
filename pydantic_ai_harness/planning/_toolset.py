@@ -336,10 +336,15 @@ class PlanningToolset(FunctionToolset[AgentDepsT]):
             ctx: Framework-provided run context.
             items: The complete ordered list of plan steps.
         """
-        store = self._resolve(ctx)
-        new_items: list[PlanItem] = []
-        for item in items:
-            new_items.append(item if self._subtasks else item.model_copy(update={'parent_id': None, 'depends_on': []}))
+        new_items = [item.model_copy(deep=True) for item in items]
+        ids = [item.id for item in new_items]
+        duplicates = sorted({item_id for item_id in ids if ids.count(item_id) > 1})
+        if duplicates:
+            return f'Plan not updated: Duplicate step ids: {", ".join(duplicates)}. Every step needs a unique id.'
+        if not self._subtasks:
+            for item in new_items:
+                item.parent_id = None
+                item.depends_on = []
         for item in new_items:
             if not self._valid_status(item.status):
                 return f"Plan not updated: status '{item.status.value}' is only valid with subtasks enabled."
@@ -351,7 +356,7 @@ class PlanningToolset(FunctionToolset[AgentDepsT]):
             # commits one bulk `set_items` and stays event-silent (no per-step events).
             for item, new_status in list(dependency_block_transitions(new_items)):
                 item.status = new_status
-        await store.set_items(new_items)
+        await self._resolve(ctx).set_items(new_items)
         in_progress = sum(1 for item in new_items if item.status is TaskStatus.in_progress)
         note = '' if in_progress <= 1 else _MULTI_IN_PROGRESS_NOTE
         return f'Plan updated: {len(new_items)} step(s).\n\n{render_plan(new_items)}{note}'

@@ -189,6 +189,10 @@ class InMemoryPlanStore:
 class SqlitePlanStore:
     """SQLite-backed plan storage, scoped to a `session` for multi-tenancy.
 
+    `:memory:` is not supported because this store opens and closes a connection
+    for each operation. Use `InMemoryPlanStore` for ephemeral plans, or a
+    file-backed SQLite database for persistence.
+
     Each blocking `sqlite3` call runs on a worker thread under a lock, so any
     single operation is safe. The read-modify-write ops (`update_item`,
     `remove_item`) span two locked calls, though, so concurrent writers on the
@@ -205,6 +209,10 @@ class SqlitePlanStore:
         event_emitter: PlanEventEmitter | None = None,
     ) -> None:
         validate_table_name(table)
+        if database == ':memory:':
+            raise ValueError(
+                "SqlitePlanStore does not support ':memory:'; use InMemoryPlanStore or a file-backed database."
+            )
         self._database = database
         self._session = session
         self._table = table

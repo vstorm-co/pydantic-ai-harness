@@ -5,7 +5,7 @@ description: Give an agent a structured, self-updating task list -- with a cache
 
 # Planning
 
-`Planning` gives the model a structured, self-updating task list through a small toolset -- and surfaces the current plan back to the model every turn without ever invalidating the prompt cache. It can stay in memory for a single run or persist to SQLite/Postgres, break steps into subtasks with dependencies, and emit events on every change.
+`Planning` gives the model a structured, self-updating task list through a small toolset -- and surfaces the current plan back to the model every turn without ever invalidating the prompt cache. It can stay in memory for a single run or persist to SQLite/Postgres, break steps into subtasks with dependencies, and emit events from granular changes.
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/planning/)
 
@@ -59,7 +59,7 @@ from pydantic_ai_harness.planning import Planning, SqlitePlanStore
 planning = Planning(store=SqlitePlanStore('plan.db', session='user-123'))
 ```
 
-Built-in stores are `InMemoryPlanStore`, `SqlitePlanStore`, `PostgresPlanStore` (over a caller-owned asyncpg pool), and `RedisPlanStore` (over a caller-owned `redis.asyncio` client) -- so the harness needs no database driver. Any `PlanStore` implementation works, and `store_resolver` selects one per run.
+Built-in stores are `InMemoryPlanStore`, `SqlitePlanStore`, `PostgresPlanStore` (over a caller-owned asyncpg pool), and `RedisPlanStore` (over a caller-owned `redis.asyncio` client) -- so the harness needs no database driver. Any `PlanStore` implementation works, and `store_resolver` selects one per run. `SqlitePlanStore` requires a file-backed database; use `InMemoryPlanStore` for ephemeral plans rather than `':memory:'`.
 
 ## Events
 
@@ -77,6 +77,8 @@ async def announce(event):
 store = InMemoryPlanStore(event_emitter=emitter)
 ```
 
+Events come from granular tools (`add_task`, `update_task_status`, `add_subtask`, ...). `write_plan` is a bulk whole-plan replacement and is **event-silent**, so a UI driven purely by events should also read the plan after a run, or steer the model toward granular tools when it needs live event coverage.
+
 ## Caching guarantee
 
 The plan is never injected into the system prompt or instructions. Static usage guidance goes there (cache-stable); only the mutable plan rides the ephemeral tail reminder, which lives solely in the per-request copy and is never persisted. Set `inject=False` to disable it. `CachePoint` is supported on Anthropic and Amazon Bedrock; on providers without prompt caching it is simply ignored.
@@ -84,6 +86,13 @@ The plan is never injected into the system prompt or instructions. Static usage 
 ## Agent spec (YAML/JSON)
 
 `Planning` works with Pydantic AI's [agent spec](/ai/core-concepts/agent-spec/):
+
+```yaml
+# agent.yaml
+model: anthropic:claude-sonnet-4-6
+capabilities:
+  - Planning: {}
+```
 
 ```python
 from pydantic_ai import Agent

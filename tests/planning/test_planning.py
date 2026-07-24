@@ -346,6 +346,37 @@ class TestWritePlan:
         assert result.startswith('Plan not updated:') and 'Duplicate step ids' in result
         assert await store.get_items() == []
 
+    async def test_subtasks_rejects_broken_hierarchy(self) -> None:
+        store = InMemoryPlanStore()
+        ts = _toolset(subtasks=True, store=store)
+        result = await ts.write_plan(_ctx(), [PlanItem(id='child', content='Child', parent_id='missing')])
+        assert result == "Plan not updated: Step 'child' has parent_id 'missing', which is not in the plan."
+        assert await store.get_items() == []
+
+    async def test_rejects_duplicate_ids_without_subtasks_before_replacing_plan(self) -> None:
+        store = InMemoryPlanStore()
+        ts = _toolset(store=store)
+        await ts.write_plan(_ctx(), [PlanItem(id='kept', content='Kept')])
+        result = await ts.write_plan(_ctx(), [PlanItem(id='same', content='A'), PlanItem(id='same', content='B')])
+        assert result == 'Plan not updated: Duplicate step ids: same. Every step needs a unique id.'
+        assert [item.id for item in await store.get_items()] == ['kept']
+
+    async def test_subtasks_plan_is_independent_of_input_items(self) -> None:
+        store = InMemoryPlanStore()
+        ts = _toolset(subtasks=True, store=store)
+        parent = PlanItem(id='parent', content='Parent')
+        child = PlanItem(id='child', content='Child', depends_on=['parent'])
+        await ts.write_plan(_ctx(), [parent, child])
+        parent.content = 'Changed parent'
+        child.content = 'Changed child'
+        child.depends_on.clear()
+        child.status = TaskStatus.completed
+        stored = await store.get_items()
+        assert [(item.content, item.status, item.depends_on) for item in stored] == [
+            ('Parent', TaskStatus.pending, []),
+            ('Child', TaskStatus.blocked, ['parent']),
+        ]
+
     async def test_rejects_blocked_status_without_subtasks(self) -> None:
         store = InMemoryPlanStore()
         ts = _toolset(store=store)
@@ -642,6 +673,11 @@ class TestCapability:
         assert Planning[None](store=store).resolve_store(_ctx()) is store
         assert Planning[None](store_resolver=lambda ctx: store).resolve_store(_ctx()) is store
 
+    async def test_direct_toolset_keeps_default_store(self) -> None:
+        toolset = PlanningToolset[None](Planning[None]())
+        await toolset.write_plan(_ctx(), [PlanItem(content='Kept')])
+        assert 'Kept' in await toolset.read_plan(_ctx())
+
     async def test_for_run_isolates_default_store(self) -> None:
         cap = Planning[None](guidance='G', cache_ttl='1h', enable_subtasks=True)
         run1 = await cap.for_run(_ctx())
@@ -654,6 +690,21 @@ class TestCapability:
         run = await Planning[None]().for_run(_ctx())
         assert run.resolve_store(_ctx()) is run.resolve_store(_ctx())
         assert isinstance(run.resolve_store(_ctx()), InMemoryPlanStore)
+
+    async def test_store_resolver_runs_once_per_run(self) -> None:
+        stores: list[InMemoryPlanStore] = []
+
+        def resolve_store(ctx: RunContext[None]) -> InMemoryPlanStore:
+            store = InMemoryPlanStore()
+            stores.append(store)
+            return store
+
+        cap = Planning[None](store_resolver=resolve_store)
+        first = await cap.for_run(_ctx())
+        second = await cap.for_run(_ctx())
+        assert first.resolve_store(_ctx()) is first.resolve_store(_ctx())
+        assert second.resolve_store(_ctx()) is second.resolve_store(_ctx())
+        assert stores == [first.resolve_store(_ctx()), second.resolve_store(_ctx())]
 
     def test_from_spec(self, tmp_path: str) -> None:
         assert Planning.from_spec().store is None

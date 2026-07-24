@@ -139,6 +139,10 @@ class TestEvents:
 
 
 class TestSqliteSpecifics:
+    def test_memory_database_rejected(self) -> None:
+        with pytest.raises(ValueError, match="does not support ':memory:'"):
+            SqlitePlanStore(':memory:')
+
     async def test_persists_across_instances(self, tmp_path: Path) -> None:
         database = str(tmp_path / 'p.db')
         store = SqlitePlanStore(database, session='s1')

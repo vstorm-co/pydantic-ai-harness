@@ -94,7 +94,8 @@ class Planning(AbstractCapability[AgentDepsT]):
         """Return the cached run store, or resolve one for direct toolset use."""
         if self._resolved_store is not None:
             return self._resolved_store
-        return self._resolve_store(ctx)
+        self._resolved_store = self._resolve_store(ctx)
+        return self._resolved_store
 
     def _resolve_store(self, ctx: RunContext[AgentDepsT]) -> PlanStore:
         if self.store_resolver is not None:
