@@ -578,6 +578,15 @@ class TestSubtaskTools:
         assert 'automatically blocked' not in result
         assert (await store.get_item(b.id)).status is TaskStatus.pending  # type: ignore[union-attr]
 
+    async def test_set_dependency_no_block_when_prereq_cancelled(self) -> None:
+        store = InMemoryPlanStore()
+        ts = _toolset(subtasks=True, store=store)
+        a = await store.add_item(PlanItem(content='A', status=TaskStatus.cancelled))
+        b = await store.add_item(PlanItem(content='B'))
+        result = await ts.set_dependency(_ctx(), b.id, a.id)
+        assert 'automatically blocked' not in result
+        assert (await store.get_item(b.id)).status is TaskStatus.pending  # type: ignore[union-attr]
+
     async def test_set_dependency_validation(self) -> None:
         store = InMemoryPlanStore()
         ts = _toolset(subtasks=True, store=store)
