@@ -2,17 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
 import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic_ai.agent import Agent, AgentRunResult, EventStreamHandler
-from pydantic_ai.capabilities import AbstractCapability, AgentCapability, WrapRunHandler
+from pydantic_ai.capabilities import (
+    AbstractCapability,
+    AgentCapability,
+    AgentNode,
+    NodeResult,
+    WrapRunHandler,
+)
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import AgentDepsT, RunContext
 from pydantic_ai.toolsets import AgentToolset
+from pydantic_graph import End
 
 from pydantic_ai_harness.subagents._disk import (
     AgentOverride,
@@ -21,7 +29,8 @@ from pydantic_ai_harness.subagents._disk import (
     resolve_folders,
 )
 from pydantic_ai_harness.subagents._effort import clamp_effort
-from pydantic_ai_harness.subagents._toolset import SubAgent, SubAgentToolset
+from pydantic_ai_harness.subagents._tasks import RunTasks
+from pydantic_ai_harness.subagents._toolset import DepsFactory, SubAgent, SubAgentToolset
 
 if TYPE_CHECKING:
     from pydantic_ai._instructions import AgentInstructions
@@ -58,11 +67,21 @@ class SubAgents(AbstractCapability[AgentDepsT]):
     `agent_folders`; see also `agent_overrides` and `tool_resolver`.
 
     The parent's `deps` are forwarded to each sub-agent (sub-agents therefore
-    share the parent's `AgentDepsT`), and by default the parent's `usage` is
-    shared so usage limits apply across the whole agent tree. Optionally, the
-    parent's tools can be inherited (`inherit_tools`), extra capabilities can be
-    applied to every sub-agent run (`shared_capabilities`), and sub-agent events
-    can be streamed to a handler (`event_stream_handler`).
+    share the parent's `AgentDepsT`; see `deps_factory` to derive per-delegation
+    deps instead), and by default the parent's `usage` is shared so usage limits
+    apply across the whole agent tree. Optionally, the parent's tools can be
+    inherited (`inherit_tools`), extra capabilities can be applied to every
+    sub-agent run (`shared_capabilities`), and sub-agent events can be streamed
+    to a handler (`event_stream_handler`).
+
+    Delegations can also run in the background (`allow_background`, on by
+    default): the delegate tool grows a `background` flag, task-management tools
+    are exposed (`check_task`, `wait_tasks`, `send_message_to_task`,
+    `cancel_task`), completed tasks notify the parent by injecting a message
+    into its conversation (`notify`), the parent can steer a running task and
+    answer its `ask_parent` questions (`SubAgent.can_ask_parent`), and the
+    end-of-run boundary waits for or cancels whatever is still running
+    (`on_parent_end`, `end_grace_seconds`).
 
     ```python
     from pydantic_ai import Agent
@@ -147,6 +166,60 @@ class SubAgents(AbstractCapability[AgentDepsT]):
     can override this per delegate. See `SubAgent.contain_errors` for the
     containment contract and what always propagates regardless."""
 
+    allow_background: bool = True
+    """Whether the model may run delegations in the background. When on, the
+    delegate tool grows a `background` flag and the task-management tools
+    (`check_task`, `wait_tasks`, `send_message_to_task`, `cancel_task`) are
+    exposed. A background delegation returns a task id immediately; the child
+    runs concurrently with the parent, its completion (or failure) is injected
+    into the parent's conversation as a `[background task ...]` message -- if
+    the parent was about to finish, it gets another turn to react -- and the
+    parent can steer it, answer its questions, and cancel it mid-run. Note:
+    `event_stream_handler` does not apply to background delegations (driving a
+    run and streaming it needs core API that `Agent.iter()` does not expose)."""
+
+    deps_factory: DepsFactory[AgentDepsT] | None = None
+    """Derives the deps for each delegation (sync and background) from the
+    parent's run context, e.g. to hand every sub-agent an isolated copy of the
+    parent's deps. When unset, the parent's `deps` are forwarded as-is. A factory
+    returning the parent's deps unchanged means sub-agents share mutable state
+    with the parent and with each other -- fine when intended, but background
+    delegations then mutate it concurrently."""
+
+    on_parent_end: Literal['wait', 'cancel'] = 'wait'
+    """What happens to still-running background tasks when the parent run would
+    end. `'wait'` (default): the run pauses at the boundary until the first task
+    finishes (bounded by `end_grace_seconds`); its completion message then gives
+    the model another turn to read the result, keep waiting, or cancel the rest --
+    the model, not the harness, decides to abandon work, but it decides informed.
+    A task waiting for an answer gets a reminder turn instead of a blind wait,
+    and is released with a "proceed with your best judgment" answer if the model
+    ignores the reminder. `'cancel'`: don't pause; whatever is still running is
+    cancelled when the run ends. On every exit path (including errors and usage
+    limits) any surviving tasks are cancelled before the run returns, so no
+    background work outlives its parent run."""
+
+    end_grace_seconds: float | None = 300.0
+    """Bound on each `'wait'` pause at the end-of-run boundary. When it expires,
+    the still-running tasks are cancelled and their cancellation notices give the
+    model one final turn. `None` waits without bound (rely on each delegate's
+    `timeout_seconds`)."""
+
+    notify: Literal['asap', 'when_idle'] | None = 'asap'
+    """When a background task's outcome is injected into the parent conversation:
+    `'asap'` before the parent's next model request, `'when_idle'` only once the
+    parent would otherwise finish its turn, `None` never (the model must poll
+    with `check_task`/`wait_tasks`)."""
+
+    max_concurrent_tasks: int | None = None
+    """Cap on simultaneously live background tasks per parent run. Over the cap,
+    a background delegation returns a soft budget message without running the
+    child. `None` (default) means no cap."""
+
+    ask_timeout_seconds: float = 300.0
+    """How long a background child's `ask_parent` waits for an answer before the
+    child is told to proceed with its best judgment."""
+
     _by_name: dict[str, SubAgent[AgentDepsT]] = field(
         default_factory=dict[str, 'SubAgent[AgentDepsT]'], init=False, repr=False, compare=False
     )
@@ -158,6 +231,12 @@ class SubAgents(AbstractCapability[AgentDepsT]):
     )
     """Run-scoped delegation counts (run_id -> name -> count), shared with the
     toolset and cleared per run in `wrap_run`. Backs `SubAgent.max_calls`."""
+
+    _tasks: dict[str, RunTasks[AgentDepsT]] = field(
+        default_factory=dict[str, 'RunTasks[AgentDepsT]'], init=False, repr=False, compare=False
+    )
+    """Run-scoped background task registries (run_id -> RunTasks), shared with the
+    toolset and finalized per run in `wrap_run`."""
 
     def __post_init__(self) -> None:
         by_name: dict[str, SubAgent[AgentDepsT]] = {}
@@ -247,11 +326,92 @@ class SubAgents(AbstractCapability[AgentDepsT]):
         return toolsets
 
     async def wrap_run(self, ctx: RunContext[AgentDepsT], *, handler: WrapRunHandler) -> AgentRunResult[Any]:
-        """Run the parent agent, then drop this run's delegation counts so they don't accumulate."""
+        """Run the parent agent, then finalize this run's background tasks and delegation counts.
+
+        The finalizer runs on every exit path (normal end, error, usage limit,
+        cancellation), so no background task ever outlives its parent run.
+        """
         try:
             return await handler()
         finally:
             self._call_counts.pop(ctx.run_id or '', None)
+            run_tasks = self._tasks.pop(ctx.run_id or '', None)
+            if run_tasks is not None:
+                await run_tasks.cancel_all()
+
+    async def after_node_run(
+        self,
+        ctx: RunContext[AgentDepsT],
+        *,
+        node: AgentNode[AgentDepsT],
+        result: NodeResult[AgentDepsT],
+    ) -> NodeResult[AgentDepsT]:
+        """Hold the end-of-run boundary while background tasks are still live (`on_parent_end='wait'`).
+
+        Runs before the pending-message drain's own `after_node_run` (the drain is
+        ordered outermost, and after-hooks run in reverse), so anything a finishing
+        task enqueues here is guaranteed to be picked up by the drain's end-of-run
+        redirect in the same pass -- the model gets another turn with the outcome
+        in front of it instead of the run silently ending or silently killing work.
+        """
+        if not isinstance(result, End) or self.on_parent_end != 'wait':
+            return result
+        run_tasks = self._tasks.get(ctx.run_id or '')
+        if run_tasks is None:
+            return result
+
+        while True:
+            # The attention event is only a wake-up signal; task state is the source
+            # of truth. Clearing before reading the states cannot lose a transition:
+            # one that lands after the clear re-sets the event, and the wait below
+            # then returns immediately for another pass.
+            run_tasks.attention.clear()
+            live = run_tasks.live()
+            if not live:
+                return result
+
+            # A task waiting for the parent's answer must not be blind-waited on:
+            # only the parent can unblock it. Remind once (the redirect gives the
+            # model a turn to answer or cancel); if the model ignored the reminder
+            # and is ending again, release the child with a best-judgment answer
+            # and go back to waiting for it like any other running task.
+            fresh_waiting = [state for state in live if state.status == 'waiting_for_answer' and not state.reminded]
+            if fresh_waiting:
+                for state in fresh_waiting:
+                    state.reminded = True
+                    ctx.enqueue(
+                        f'Background task {state.task_id!r} ({state.agent_name}) is still waiting for your answer: '
+                        f"{state.pending_question} -- answer with send_message_to_task('{state.task_id}', ...) "
+                        f"or cancel_task('{state.task_id}').",
+                        priority='asap',
+                    )
+                return result
+            for state in live:
+                if state.status == 'waiting_for_answer':
+                    state.resolve_answer(
+                        'Your parent agent is finishing without answering. Proceed with your best judgment.'
+                    )
+
+            workers = [
+                state.asyncio_task for state in live if state.asyncio_task is not None and not state.asyncio_task.done()
+            ]
+            if not workers:  # pragma: no cover - live tasks always have a live worker
+                return result
+            waker = asyncio.ensure_future(run_tasks.attention.wait())
+            done, _pending = await asyncio.wait(
+                [*workers, waker], timeout=self.end_grace_seconds, return_when=asyncio.FIRST_COMPLETED
+            )
+            waker.cancel()
+            if done:
+                # A worker finished, or a task changed status mid-pause (e.g. it
+                # started waiting for an answer) -- re-evaluate everything.
+                continue
+            # Grace expired with nothing happening: cancel the stragglers and let
+            # their cancellation notices give the model one final, informed turn.
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            return result
 
     def get_instructions(self) -> AgentInstructions[AgentDepsT] | None:
         """Static, cache-stable listing of the available sub-agents."""
@@ -262,11 +422,21 @@ class SubAgents(AbstractCapability[AgentDepsT]):
             description = sub_agent.description or sub_agent.agent.description
             lines.append(f'- {name}: {description}' if description else f'- {name}')
         listing = '\n'.join(lines)
-        return (
+        instructions = (
             f'You can delegate self-contained tasks to these sub-agents using the `{self.tool_name}` '
             f'tool. Each runs in its own fresh context and does not see this conversation, so pass '
             f'everything it needs.\n\nAvailable sub-agents:\n{listing}'
         )
+        if self.allow_background:
+            instructions += (
+                f'\n\nDelegations can also run in the background: call `{self.tool_name}` with '
+                f'`background=true` to start one and keep working; a `[background task ...]` message '
+                f'arrives when it finishes. Manage running tasks with `check_task`, `wait_tasks`, '
+                f'`send_message_to_task` (steer a task, or answer a question it asked you), and '
+                f'`cancel_task`. Cancel tasks you no longer need before finishing -- ending your reply '
+                f'waits for (or cancels) whatever is still running.'
+            )
+        return instructions
 
     def get_toolset(self) -> AgentToolset[AgentDepsT] | None:
         """Toolset providing the delegate tool, or `None` when no sub-agents are configured."""
@@ -282,6 +452,12 @@ class SubAgents(AbstractCapability[AgentDepsT]):
             tool_retries=self.tool_retries,
             contain_errors=self.contain_errors,
             call_counts=self._call_counts,
+            allow_background=self.allow_background,
+            deps_factory=self.deps_factory,
+            notify=self.notify,
+            max_concurrent_tasks=self.max_concurrent_tasks,
+            ask_timeout_seconds=self.ask_timeout_seconds,
+            run_tasks=self._tasks,
         )
 
     @classmethod

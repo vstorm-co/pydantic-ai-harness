@@ -37,14 +37,20 @@ print(result.output)
 
 A delegate's name -- how the parent model refers to it, and how it is listed in the prompt -- is the agent's own `name`, or a `SubAgent(name=...)` override. Two delegates resolving to the same name is an error, and an agent with no name and no override is rejected.
 
-## The tool
+## The tools
 
 | Tool | Purpose |
 |---|---|
-| `delegate_task(agent_name, task)` | Run the named sub-agent on a self-contained task and return its output. |
+| `delegate_task(agent_name, task, background=False)` | Run the named sub-agent on a self-contained task. Blocking by default; with `background=True` it returns a task id immediately and the child runs concurrently (see "Background delegation"). |
+| `check_task(task_id=None)` | One task's full status and result, or a one-line listing of every background task of this run. |
+| `wait_tasks(task_ids, timeout=300, mode='all')` | Wait for background tasks to finish (`'all'`) or for the first finisher (`'any'`); returns early when a task starts waiting for an answer. |
+| `send_message_to_task(task_id, message)` | Steer a running background task, or answer a question it asked. |
+| `cancel_task(task_id, force=False)` | Stop a background task at its next step boundary, or immediately with `force=True`. |
+
+The management tools exist only when `allow_background=True` (the default); with `allow_background=False` the surface is exactly the single blocking `delegate_task(agent_name, task)`.
 
 - The sub-agent runs with its own message history, so `task` must be self-contained.
-- An unknown `agent_name` raises `ModelRetry`, so the model can correct itself.
+- An unknown `agent_name` or `task_id` raises `ModelRetry`, so the model can correct itself.
 - The result returned to the parent is `str(result.output)`.
 
 ## Deps, usage, tools, and capabilities
@@ -94,6 +100,35 @@ A sub-agent run that fails with a *soft model error* (`ModelRetry`, `UnexpectedM
 Hard errors propagate to stop the whole run. A `UsageLimitExceeded` from a child that has *no* per-delegate `usage_limits` (so it shares the parent's accounting) means the whole tree is out of budget and propagates; a child reaching its *own* `usage_limits` is soft, as above.
 
 An *unexpected crash* -- any other exception the child raises, such as a provider `ModelAPIError`/`FallbackExceptionGroup` or a plain `ValueError` from a bad tool argument -- propagates by default and aborts the parent run. Set `contain_errors=True` (per delegate, or as the `SubAgents` default) to catch it and return it to the parent as a bounded `ModelRetry` instead, so one delegate crash cannot kill the whole run. Containment stays loud: the exception rides the retry message (`Sub-agent '<name>' crashed: ...`), it is logged via the standard `logging` module, and `tool_retries` still bounds consecutive crashes into an abort. This is orthogonal to `on_failure` -- a contained crash always raises the loud retry, never the soft `on_failure` return, so a genuine bug is never masked as success. Cancellation, a shared `UsageLimitExceeded`, pydantic-ai control-flow signals (`CallDeferred`, `ApprovalRequired`, the `Skip*` signals), and `UserError` always propagate regardless of `contain_errors`.
+
+## Background delegation
+
+With `background=True`, `delegate_task` returns a task id immediately and the child runs concurrently with the parent -- the parent keeps working (or delegates more tasks) while the child churns. The whole channel is built on pydantic-ai's pending-message queue (`enqueue`), so there is no polling anywhere on the happy path.
+
+**Completion notifications.** When a background task finishes (completes, fails, or is cancelled), its outcome is injected into the parent conversation as a `[background task <id>] ...` message: before the parent's next model request, or -- if the parent was about to end its run -- through the queue drain's end-of-run redirect, which gives the model another turn to react to the result. `notify` controls this: `'asap'` (default), `'when_idle'` (only once the parent would otherwise finish), or `None` (no notifications; the model polls with `check_task`/`wait_tasks`). The notification carries a bounded preview; the full result is available via `check_task`.
+
+**Steering.** `send_message_to_task` injects a message into the running child's next model request, without losing its progress -- the same primitive the parent's own notifications use, pointed at the child's run.
+
+**Questions from the child.** A delegate with `can_ask_parent=True` gets an `ask_parent(question)` tool in background runs. Asking parks the child (`waiting_for_answer`), injects the question into the parent conversation, and resumes the child when the parent answers via `send_message_to_task`. A parent that never answers releases the child after `ask_timeout_seconds` with a "proceed with your best judgment" answer, so a silent parent degrades the child instead of hanging it. `wait_tasks` treats a waiting task as an event and returns early, so the parent can't deadlock waiting on a child that is waiting on it.
+
+**Cancellation.** `cancel_task` requests a cooperative stop: the child finishes its in-flight step and stops at the next node boundary (a pending `ask_parent` is unblocked immediately). `force=True` cancels the child's task outright, interrupting an in-flight tool call.
+
+**The end-of-run boundary.** What happens when the parent model tries to finish while background tasks are still live is `on_parent_end`:
+
+- `'wait'` (default): the run pauses at the boundary until the first task finishes (bounded by `end_grace_seconds`, default 300); the finisher's notification then redirects the run, and the model -- now informed -- decides to read results, keep waiting, or cancel the rest. A task still waiting for an answer gets a reminder turn instead of a blind wait; if the model ignores the reminder and ends again, the child is released with a best-judgment answer. When the grace expires, the stragglers are cancelled and their cancellation notices give the model one final turn.
+- `'cancel'`: no pause; whatever is still running is cancelled when the run ends.
+
+On every exit path -- normal end, exception, usage limit, cancellation of the parent itself -- surviving tasks are cancelled before the run returns, so no background work ever outlives its parent run.
+
+**Budgets and failures in the background.** The per-delegate controls apply unchanged: `timeout_seconds` bounds the child (a timeout becomes a cancellation notice), `max_calls` counts both modes, `usage_limits` gives the child its own budget, and `max_concurrent_tasks` caps how many tasks a run may have live at once. A background failure is always soft -- it reaches the parent as a notification, never as an exception -- so `contain_errors` is meaningful only for blocking delegations, and `on_failure` replaces the body of failure/cancellation notifications. Two blocking-mode features don't carry over: `event_stream_handler` is not applied to background runs (driving a run and streaming it needs core API that `Agent.iter()` does not expose), and a child that needs human-in-the-loop control flow (`CallDeferred`/`ApprovalRequired`) fails with an explicit message telling the model to delegate it synchronously instead.
+
+**Per-delegate mode control.** `SubAgent(background=True)` always runs that delegate in the background; `SubAgent(background=False)` refuses background delegation with a retry; unset lets the model choose per call.
+
+**Deriving deps per delegation.** By default the parent's `deps` are forwarded as-is to every child (blocking and background alike). Pass `deps_factory` to derive them instead -- e.g. to hand each sub-agent an isolated copy so concurrent background children don't share mutable state:
+
+```python
+SubAgents(agents=[...], deps_factory=lambda ctx: ctx.deps.clone_for_subagent())
+```
 
 ## Discovery
 
@@ -185,6 +220,13 @@ SubAgents(
     tool_name='delegate_task',
     tool_retries=2,        # extra delegate-tool attempts after a sub-agent error before aborting (None inherits the agent default)
     contain_errors=False,  # default for SubAgent.contain_errors: contain an unexpected crash as a bounded retry
+    allow_background=True, # expose the background flag and the task-management tools
+    deps_factory=None,     # Callable[[RunContext[AgentDepsT]], AgentDepsT] -- derive per-delegation deps
+    on_parent_end='wait',  # 'wait' | 'cancel' -- what happens to live tasks when the parent run would end
+    end_grace_seconds=300.0,  # bound on each end-of-run pause (None waits without bound)
+    notify='asap',         # 'asap' | 'when_idle' | None -- when task outcomes are injected into the parent
+    max_concurrent_tasks=None,  # cap on simultaneously live background tasks per run
+    ask_timeout_seconds=300.0,  # how long ask_parent waits before releasing the child
 )
 ```
 
@@ -198,6 +240,8 @@ SubAgent(
     max_calls=None,        # max delegations to this sub-agent per parent run
     on_failure=None,       # steering message for soft degradations of this delegate
     contain_errors=None,   # contain an unexpected crash as a bounded retry; None inherits the SubAgents default
+    background=None,       # True forces background, False refuses it, None lets the model choose
+    can_ask_parent=False,  # give background runs of this delegate an ask_parent tool
 )
 ```
 
